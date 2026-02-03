@@ -1,0 +1,22 @@
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Output files
+daily_jobs.xlsx
+*.xlsx
+
+# Resume (keep private)
+*.pdf
+
+# Config with API keys (keep private!)
+config.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
