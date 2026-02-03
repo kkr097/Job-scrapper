@@ -20,14 +20,25 @@ A Python-based job scraper that finds relevant job postings, rates them using AI
 
 ## 🚀 Quick Start
 
-### 1. Install dependencies
+### 1. Clone the repository
+```bash
+git clone https://github.com/bharath1996-hub/Job-scrapper.git
+cd Job-scrapper
+```
+
+### 2. Install dependencies
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure
+### 3. Configure
+Copy the example config and add your API key:
+```bash
+cp config.example.json config.json
+```
+
 Edit `config.json`:
 ```json
 {
@@ -40,10 +51,10 @@ Edit `config.json`:
 }
 ```
 
-### 3. Add your resume
+### 4. Add your resume
 Place your resume PDF in the project folder (any filename ending in `.pdf`).
 
-### 4. Run
+### 5. Run
 ```bash
 python main.py
 ```
