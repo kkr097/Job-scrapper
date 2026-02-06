@@ -1,0 +1,79 @@
+{
+    "search": {
+        "location": [
+            "Ingolstadt",
+            "Munich",
+            "Muenchen",
+            "Regensburg",
+            "Nuernberg",
+            "Erlangen",
+            "Augsburg",
+            "Bayern"
+        ],
+        "max_days_old": 2
+    },
+    "exclude_keywords": [
+        "senior",
+        "lead",
+        "intern",
+        "masterarbeit",
+        "werkstudent",
+        "manager",
+        "owner",
+        "wissenschaftliche mitarbeiter",
+        "director",
+        "praktikant",
+        "student"
+    ],
+    "exclude_description_keywords": [
+        "rust",
+        "ai",
+        "ml",
+        "ki",
+        "gui",
+        "qt",
+        "qa",
+        "plc",
+        "java",
+        "android"
+    ],
+    "include_description_keywords": [
+        "c++",
+        "c",
+        "matlab",
+        "simulink",
+        "v-model",
+        "can",
+        "lin",
+        "iso 26262",
+        "autosar",
+        "ci/cd",
+        "agile",
+        "integration",
+        "python",
+        "misra",
+        "istqb",
+        "architekt"
+    ],
+    "sources": {
+        "linkedin": true,
+        "arbeitnow": true,
+        "simplyhired": true,
+        "company_careers": true
+    },
+    "company_careers_file": "career_pages.json",
+    "company_careers_max_pages": 5,
+    "company_careers_max_scrolls": 8,
+    "company_careers_test_only": [],
+    "output": {
+        "excel_file": "daily_jobs.csv"
+    },
+    "output_nonmatch_file": "daily_jobs_nonmatch.csv",
+    "cache_file": "seen_jobs_cache.json",
+    "cache_days": 45,
+    "min_score": 5,
+    "groq_wait_seconds": 30,
+    "rating_preferred": "groq"
+    ,
+    "scrape_test_mode": false
+}

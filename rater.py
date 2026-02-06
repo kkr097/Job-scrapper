@@ -18,32 +18,40 @@ class JobRater:
         self.resume_summary = resume_summary
         self.config = config
         
-        # Determine which API to use (order by reliability of free tier)
+        # Determine which API to use
         self.api_type = None
         self.api_key = None
-        
-        # Check Groq FIRST (truly free, no payment needed)
-        if config.get('groq_api_key') and config['groq_api_key'].startswith('gsk_'):
+
+        self.has_groq = bool(config.get('groq_api_key', '').startswith('gsk_'))
+        self.has_gemini = bool(config.get('gemini_api_key', '').startswith('AIza'))
+        self.has_deepseek = bool(config.get('deepseek_api_key', '').startswith('sk-'))
+
+        if self.has_groq and self.has_gemini:
+            self.api_type = 'multi'
+            print("   ? Using Groq + Gemini with smart switching")
+        elif self.has_groq:
             self.api_type = 'groq'
             self.api_key = config['groq_api_key']
-            print("   ✓ Using Groq (Llama) - FREE tier")
-        
-        # Check Gemini second (free 1500/day)
-        elif config.get('gemini_api_key') and config['gemini_api_key'].startswith('AIza'):
+            print("   ? Using Groq (Llama) - FREE tier")
+        elif self.has_gemini:
             self.api_type = 'gemini'
             self.api_key = config['gemini_api_key']
-            print("   ✓ Using Gemini AI")
-        
-        # Check DeepSeek last (requires credits)
-        elif config.get('deepseek_api_key') and config['deepseek_api_key'].startswith('sk-'):
+            print("   ? Using Gemini AI")
+        elif self.has_deepseek:
             self.api_type = 'deepseek'
             self.api_key = config['deepseek_api_key']
-            print("   ✓ Using DeepSeek AI")
-        
+            print("   ? Using DeepSeek AI")
         else:
-            print("   ⚠ No API key configured")
+            print("   ? No API key configured")
             self.api_type = None
-    
+
+        # LLM routing state for optimal switching
+        self._llm_state = {
+            "preferred": config.get("rating_preferred", "groq"),
+            "groq_cooldown_until": 0,
+            "gemini_cooldown_until": 0
+        }
+
     def rate_jobs(self, jobs: List[Dict], batch_size: int = 5) -> List[Dict]:
         """Rate all jobs against the resume."""
         if not self.api_type:
@@ -66,7 +74,12 @@ class JobRater:
                 
                 # Rate limit delay
                 if i + batch_size < len(jobs):
-                    time.sleep(1.5)
+                    if self.api_type in ['gemini', 'groq', 'multi']:
+                        wait_seconds = int(self.config.get('groq_wait_seconds', 30))
+                        print(f"   Waiting {wait_seconds}s to avoid rate limits...")
+                        time.sleep(wait_seconds)
+                    else:
+                        time.sleep(1.5)
                     
             except Exception as e:
                 print(f"   ⚠ Rating error: {e}")
@@ -89,22 +102,27 @@ class JobRater:
         # Use a shorter resume summary to fit token limits
         short_summary = self.resume_summary[:1500] if len(self.resume_summary) > 1500 else self.resume_summary
         
-        prompt = f"""Rate these jobs for a Mechanical Design Engineer with CATIA V5, Autodesk Inventor, automotive wireharness, railway systems experience.
+        prompt = f"""Rate these jobs against the candidate and keyword rules.
+
+Candidate summary:
+{short_summary}
+
+Positive keywords (should match): {', '.join(self.config.get('include_description_keywords', []))}
+Negative keywords (should penalize): {', '.join(self.config.get('exclude_description_keywords', []))}
+Negative title keywords (should penalize if present): {', '.join(self.config.get('exclude_keywords', []))}
 
 JOBS:
 {job_list}
-Score 1-10 (10=perfect match for CAD/mechanical design, 1=wrong field like software/IT).
+Score 1-10 (10=strong match, 1=wrong field).
 
 Return ONLY JSON:
-{{"ratings": [{{"job": 1, "score": 8, "reasons": "CAD role", "missing": "German"}}, {{"job": 2, "score": 3, "reasons": "IT role", "missing": "wrong field"}}]}}"""
+{{"ratings": [{{"job": 1, "score": 8, "reasons": "keyword match", "missing": "missing key skills"}}, {{"job": 2, "score": 3, "reasons": "negative keywords", "missing": "wrong field"}}]}}"""
 
         # Call the appropriate API
         if self.api_type == 'deepseek':
             result = self._call_deepseek(prompt)
-        elif self.api_type == 'groq':
-            result = self._call_groq(prompt)
-        elif self.api_type == 'gemini':
-            result = self._call_gemini(prompt)
+        elif self.api_type in ['groq','gemini','multi']:
+            result = self._call_best_model(prompt)
         else:
             result = None
         
@@ -177,10 +195,11 @@ Return ONLY JSON:
     def _call_groq(self, prompt: str) -> str:
         """Call Groq API (free Llama)."""
         try:
+            api_key = self.config.get('groq_api_key', '')
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {self.api_key}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
                 },
                 json={
@@ -191,6 +210,11 @@ Return ONLY JSON:
                 },
                 timeout=60
             )
+            if response.status_code == 429:
+                wait_seconds = int(self.config.get('groq_wait_seconds', 30))
+                self._llm_state["groq_cooldown_until"] = time.time() + wait_seconds
+                print(f"   Groq rate limit hit. Cooling down {wait_seconds}s...")
+                return None
             if response.status_code != 200:
                 print(f"   Groq response: {response.text[:200]}")
             response.raise_for_status()
@@ -203,15 +227,52 @@ Return ONLY JSON:
         """Call Gemini API."""
         try:
             from google import genai
-            client = genai.Client(api_key=self.api_key)
+            api_key = self.config.get('gemini_api_key', '')
+            client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=prompt
             )
             return response.text
         except Exception as e:
             print(f"   Gemini error: {e}")
+            if "429" in str(e):
+                wait_seconds = int(self.config.get('groq_wait_seconds', 30))
+                self._llm_state["gemini_cooldown_until"] = time.time() + wait_seconds
+                print(f"   Gemini rate limit hit. Cooling down {wait_seconds}s...")
             return None
+
+    def _call_best_model(self, prompt: str) -> str:
+        now = time.time()
+        pref = self._llm_state.get("preferred", "groq")
+        groq_ready = self.has_groq and now >= self._llm_state.get("groq_cooldown_until", 0)
+        gemini_ready = self.has_gemini and now >= self._llm_state.get("gemini_cooldown_until", 0)
+
+        if pref == "groq" and groq_ready:
+            res = self._call_groq(prompt)
+            if res:
+                return res
+        if pref == "gemini" and gemini_ready:
+            res = self._call_gemini(prompt)
+            if res:
+                return res
+
+        if groq_ready:
+            res = self._call_groq(prompt)
+            if res:
+                return res
+        if gemini_ready:
+            res = self._call_gemini(prompt)
+            if res:
+                return res
+
+        # Both cooling down: wait for earliest
+        wait = min(self._llm_state["groq_cooldown_until"], self._llm_state["gemini_cooldown_until"]) - now
+        if wait > 0:
+            wait_seconds = int(wait)
+            print(f"   Both models cooling down. Waiting {wait_seconds}s...")
+            time.sleep(wait_seconds)
+        return self._call_groq(prompt) or self._call_gemini(prompt)
 
 
 if __name__ == "__main__":

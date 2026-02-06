@@ -86,6 +86,89 @@ def parse_resume(folder: str = ".") -> dict:
     }
 
 
+def extract_job_titles(resume_text: str) -> list:
+    """
+    Extract likely job titles from resume text.
+    Looks for lines containing common title keywords.
+    """
+    import re
+    title_keywords = [
+        "engineer", "designer", "konstrukteur", "entwickler",
+        "techniker", "mechanical", "cad", "design"
+    ]
+    titles = set()
+    for line in resume_text.splitlines():
+        cleaned = re.sub(r"\s+", " ", line).strip()
+        if not cleaned or len(cleaned) > 80:
+            continue
+        lower = cleaned.lower()
+        if any(k in lower for k in title_keywords):
+            # Keep short, title-like lines
+            if 2 <= len(cleaned.split()) <= 6:
+                titles.add(cleaned)
+    return list(titles)
+
+
+def generate_config_from_resume(
+    folder: str = ".",
+    default_locations: list = None,
+    exclude_keywords: list = None,
+    exclude_description_keywords: list = None,
+    include_description_keywords: list = None
+) -> dict:
+    """
+    Build a config.json dict from the resume PDF plus provided defaults.
+    Does not write to disk.
+    """
+    data = parse_resume(folder)
+    resume_text = data["full_text"]
+
+    # Default job search keywords if none are found
+    base_keywords = [
+        "Mechanical Engineer",
+        "Mechanical Design Engineer",
+        "CAD Engineer",
+        "Design Engineer",
+        "Konstrukteur",
+        "Maschinenbauingenieur",
+        "Produktentwickler"
+    ]
+
+    extracted_titles = extract_job_titles(resume_text)
+
+    # Add skills as keyword variants (only if they look like role terms)
+    skill_keywords = []
+    for skill in data.get("skills", []):
+        if any(k in skill.lower() for k in ["cad", "design", "mechanical", "nx", "catia"]):
+            skill_keywords.append(skill)
+
+    keywords = list(dict.fromkeys(extracted_titles + base_keywords + skill_keywords))
+    if not keywords:
+        keywords = base_keywords
+
+    config = {
+        "search": {
+            "keywords": keywords,
+            "location": default_locations or ["Germany"],
+            "max_days_old": 2
+        },
+        "exclude_keywords": exclude_keywords or [],
+        "exclude_description_keywords": exclude_description_keywords or [],
+        "include_description_keywords": include_description_keywords or [],
+        "sources": {
+            "linkedin": True,
+            "arbeitnow": True,
+            "simplyhired": True,
+            "company_careers": True
+        },
+        "output": {
+            "excel_file": "daily_jobs.xlsx"
+        }
+    }
+
+    return config
+
+
 def get_resume_summary(folder: str = ".") -> str:
     """Get a concise summary of the resume for AI prompts."""
     data = parse_resume(folder)

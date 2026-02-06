@@ -2,12 +2,15 @@
 Excel Exporter - Exports jobs to a formatted, color-coded Excel file.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
+import os
 from typing import List, Dict
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+import csv
+import json
 
 
 def export_to_excel(jobs: List[Dict], output_path: str = "daily_jobs.xlsx"):
@@ -123,6 +126,210 @@ def export_to_excel(jobs: List[Dict], output_path: str = "daily_jobs.xlsx"):
     print(f"✓ Saved to: {output_path}")
     
     return output_path
+
+
+def append_new_to_excel(jobs: List[Dict], output_path: str = "daily_jobs.xlsx"):
+    """
+    Append new jobs to an existing Excel file, skipping duplicates by Title+Company+URL.
+    If file doesn't exist, create it.
+    """
+    if not jobs:
+        print("✓ No new jobs to append.")
+        return output_path
+
+    if not os.path.exists(output_path):
+        return export_to_excel(jobs, output_path)
+
+    wb = load_workbook(output_path)
+    ws = wb["Job Matches"] if "Job Matches" in wb.sheetnames else wb.active
+
+    # Find header indexes
+    headers = [cell.value for cell in ws[1]]
+    col_map = {h: i + 1 for i, h in enumerate(headers) if h}
+    title_col = col_map.get("Title", 2)
+    company_col = col_map.get("Company", 3)
+    url_col = col_map.get("URL", 8)
+    score_col = col_map.get("Score", 1)
+    source_col = col_map.get("Source", 5)
+    location_col = col_map.get("Location", 4)
+    reasons_col = col_map.get("Match Reasons", 6)
+    missing_col = col_map.get("Missing", 7)
+
+    # Build existing keys (URL only)
+    existing = set()
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        url = (row[url_col - 1] or "").strip().lower()
+        if url:
+            existing.add(url)
+
+    # Styles
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+
+    new_count = 0
+    for job in jobs:
+        title = (job.get("title", "") or "").strip()
+        company = (job.get("company", "") or "").strip()
+        url = (job.get("url", "") or "").strip()
+        key = url.lower()
+        if key in existing:
+            continue
+
+        next_row = ws.max_row + 1
+        score = job.get("score", 0)
+        if score >= 8:
+            row_fill = green_fill
+        elif score >= 5:
+            row_fill = yellow_fill
+        else:
+            row_fill = red_fill
+
+        values = {
+            score_col: score,
+            title_col: title,
+            company_col: company,
+            location_col: job.get("location", ""),
+            source_col: job.get("source", ""),
+            reasons_col: job.get("match_reasons", ""),
+            missing_col: job.get("missing_skills", ""),
+            url_col: url
+        }
+
+        for col, value in values.items():
+            cell = ws.cell(row=next_row, column=col, value=value)
+            cell.fill = row_fill
+            cell.border = border
+            cell.alignment = Alignment(vertical='center', wrap_text=True)
+            if col == url_col and value:
+                cell.hyperlink = value
+                cell.font = Font(color="0563C1", underline="single")
+
+        new_count += 1
+        existing.add(key)
+
+    # Update summary sheet if present
+    if "Summary" in wb.sheetnames:
+        summary = wb["Summary"]
+        # Recompute totals from sheet
+        scores = [r[score_col - 1] for r in ws.iter_rows(min_row=2, values_only=True) if r]
+        summary['B4'] = len(scores)
+        summary['B5'] = len([s for s in scores if isinstance(s, (int, float)) and s >= 8])
+        summary['B6'] = len([s for s in scores if isinstance(s, (int, float)) and 5 <= s < 8])
+        summary['B7'] = len([s for s in scores if isinstance(s, (int, float)) and s < 5])
+
+    wb.save(output_path)
+    print(f"✓ Appended {new_count} new jobs to: {output_path}")
+    return output_path
+
+
+def append_new_to_csv(jobs: List[Dict], output_path: str = "daily_jobs.csv"):
+    """
+    Append new jobs to a CSV, skipping duplicates by URL only.
+    If file doesn't exist, create it with headers.
+    """
+    if not jobs:
+        print("✓ No new jobs to append.")
+        return output_path
+
+    headers = ["Score", "Title", "Company", "Location", "Source", "Match Reasons", "Missing", "URL"]
+    existing = set()
+
+    if os.path.exists(output_path):
+        with open(output_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                url = (row.get("URL") or "").strip().lower()
+                if url:
+                    existing.add(url)
+
+    new_rows = []
+    for job in jobs:
+        url = (job.get("url", "") or "").strip()
+        if url.lower() in existing:
+            continue
+        new_rows.append({
+            "Score": job.get("score", 0),
+            "Title": job.get("title", ""),
+            "Company": job.get("company", ""),
+            "Location": job.get("location", ""),
+            "Source": job.get("source", ""),
+            "Match Reasons": job.get("match_reasons", ""),
+            "Missing": job.get("missing_skills", ""),
+            "URL": url
+        })
+        if url:
+            existing.add(url.lower())
+
+    if not os.path.exists(output_path):
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(new_rows)
+    else:
+        with open(output_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writerows(new_rows)
+
+    print(f"✓ Appended {len(new_rows)} new jobs to: {output_path}")
+    return output_path
+
+
+def load_existing_urls(csv_path: str) -> set:
+    """Load existing job URLs from a CSV file."""
+    existing = set()
+    if not os.path.exists(csv_path):
+        return existing
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            url = (row.get("URL") or row.get("url") or "").strip().lower()
+            if url:
+                existing.add(url)
+    return existing
+
+
+def load_cache(cache_path: str) -> dict:
+    """Load seen jobs cache from JSON."""
+    if not os.path.exists(cache_path):
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cache(cache_path: str, cache: dict) -> None:
+    """Save seen jobs cache to JSON."""
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def prune_cache(cache: dict, max_days: int) -> dict:
+    """Remove cache entries older than max_days based on last_seen."""
+    if not max_days:
+        return cache
+    cutoff = datetime.now() - timedelta(days=max_days)
+    pruned = {}
+    for url, entry in cache.items():
+        last_seen = entry.get("last_seen")
+        if not last_seen:
+            pruned[url] = entry
+            continue
+        try:
+            ts = datetime.fromisoformat(last_seen)
+            if ts >= cutoff:
+                pruned[url] = entry
+        except Exception:
+            pruned[url] = entry
+    return pruned
 
 
 if __name__ == "__main__":

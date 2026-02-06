@@ -1,0 +1,301 @@
+{
+    "pages": [
+        {
+            "name": "brainlab",
+            "url": "https://www.brainlab.com/career/jobs/",
+            "filters": {
+                "country": ["germany"],
+                "position": ["software"]
+            },
+            "job_link_patterns": [
+                "/career/jobs/"
+            ]
+        },
+        {
+            "name": "zeiss",
+            "url": "https://www.zeiss.com/career/de/stellensuche.html?page=1",
+            "filters": {
+                "suche nach rolle oder schlüsselwort": ["software"],
+                "standort": ["germany"]
+            },
+            "apply_filters": true,
+            "job_link_patterns": [
+                "zeissgroup\\.wd3\\.myworkdayjobs\\.com/.*/job/",
+                "myworkdayjobs\\.com/.*/job/"
+            ],
+            "allow_external_job_links": true,
+            "require_keyword": false
+        },
+        {
+            "name": "gi-de",
+            "url": "https://www.gi-de.com/en/careers/jobs?country=DE&department=5&entry_level=3",
+            "filters": {
+                "country": ["DE"],
+                "entry_level": ["3"],
+                "department": ["5"]
+            },
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/jobs-detail-view/"
+            ]
+        },
+        {
+            "name": "capgemini",
+            "url": "https://www.capgemini.com/de-de/karriere/jobs/?country_code=de-de&country_name=Germany&location=Gaimersheim%2CIngolstadt%2CMuenchen%2CNuernberg%2CStuttgart%2CDonauwoerth&size=15",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/jobs/\\d+-de_DE"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "wenglor",
+            "url": "https://www.wenglor.com/en/Direct-Entry/s/Direkteinstieg?Stellenanzeigen+Karriere+-+Direkteinstieg=%3Afacet-open-country%3Afacet-open-audience%3Aaudience3a3b1f6e7f000002010ad492e7837dd6&_gl=1*1pah1q5*_up*MQ..*_gs*MQ..&gclid=Cj0KCQiAnJHMBhDAARIsABr7b846Q6cTpT7VhTZrhjgZuUdhOn7bf7rUDaSVLTqtqcpZUYag3YWtuUIaAh4_EALw_wcB&gbraid=0AAAAADpfCHdTtLmccRFapolFz1WuyS-Kz",
+            "filters": {
+                "country": ["germany"],
+                "applications range": ["research & development"]
+            },
+            "apply_filters": true,
+            "job_link_patterns": [
+                "wenglorsensoric\\.softgarden\\.io/job/"
+            ],
+            "allow_external_job_links": true
+        },
+        {
+            "name": "cognizant-mobility",
+            "url": "https://jobs.cognizant-mobility.com/",
+            "filters": {
+                "bereich waehlen": [
+                    "softwareentwicklung",
+                    "testing"
+                ]
+            },
+            "job_link_patterns": [
+                "/job/\\d+"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "data-modul",
+            "url": "https://career.data-modul.com/eng?_gl=1*ixt0c5*_gcl_au*ODYwNjI0NzU0LjE3NzAyOTg4MjY.*_ga*MTAyNTU3NTIzLjE3NzAyOTg4MjY.*_ga_D347SNZ53Q*czE3NzAyOTg4MjUkbzEkZzEkdDE3NzAyOTkwOTkkajYwJGwwJGgw",
+            "filters": {
+                "keyword": ["software"]
+            },
+            "job_link_patterns": [
+                "/.*-j\\d+\\.html"
+            ],
+            "require_keyword": false,
+            "apply_filters": false
+        },
+        {
+            "name": "iba-ag",
+            "url": "https://iba-ag.jobs.personio.com/",
+            "filters": {
+                "employment type": ["permanent employee"]
+            },
+            "job_link_patterns": [
+                "/job/\\d+"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "mekra",
+            "url": "https://career.mekra.de/stellenangebote/stellenangebote?category=11",
+            "filters": {
+                "application area": ["research and development"]
+            },
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/stellenangebote/stellenangebote/.+-detail/[^/]+"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "mvtec",
+            "url": "https://jobs.mvtec.com/de",
+            "filters": {},
+            "job_link_patterns": [
+                "/.*-j\\d+\\.html"
+            ],
+            "require_keyword": false,
+            "apply_filters": false
+        },
+        {
+            "name": "membrain-it",
+            "url": "https://www.membrain-it.com/de/unternehmen/karriere",
+            "filters": {
+                "abteilung": ["IT/Softwareentwicklung"]
+            },
+            "job_link_patterns": [
+                "/de/unternehmen/karriere/details/\\d+"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "livanova",
+            "url": "https://careers.livanova.com/de/de/search-results",
+            "filters": {
+                "land": ["deutschland"],
+                "kategorie": ["sonstiges"]
+            },
+            "job_link_patterns": [
+                "/de/de/job/JR-\\d+/"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "toolsforhumanity",
+            "url": "https://www.toolsforhumanity.com/de-de/careers?location=d5777778-9078-4824-8aec-7142b9bf116d&team=Device",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "jobs\\.ashbyhq\\.com/Tools%20for%20Humanity/"
+            ],
+            "allow_external_job_links": true,
+            "require_keyword": false
+        },
+        {
+            "name": "wsa",
+            "url": "https://careersemea.wsa.com/jobs?split_view=true&query=&department=Research+%26+Development&country=Germany",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/jobs/\\d+-"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "valentum",
+            "url": "https://www.valentum.de/karriere/stellenangebote.html#ad_searchform",
+            "filters": {
+                "tätigkeitsfeld": ["entwicklung software"],
+                "region": ["bayern"]
+            },
+            "job_link_patterns": [
+                "/stellenanzeige/\\d+/.*\\.html$"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "ferchau_fahrzeugtechnik",
+            "url": "https://touch.ferchau.com/de/de?type=3&searchTerm=software&city=Ingolstadt%2C+Bayern%2C+Deutschland%3B48.763382%3B11.424511&radius=100&rangeAndFaculty%5B0%5D=12005&jobType=1&sortingType=distance&sortingDirection=ASC",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/de/de/job/\\d+/"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "ferchau_luft_raumfahrttechnik",
+            "url": "https://touch.ferchau.com/de/de?type=3&searchTerm=software&city=Ingolstadt%2C+Bayern%2C+Deutschland%3B48.763382%3B11.424511&radius=100&rangeAndFaculty%5B0%5D=12003&jobType=1&sortingType=distance&sortingDirection=ASC",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/de/de/job/\\d+/"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "alten",
+            "url": "https://www.alten-germany.de/en/jobs/?job_search=software&location%5bsearch%5d=85055%20ingolstadt-unterhaunstadt%2c%20germany&location%5blat%5d=48.7913836&location%5blon%5d=11.4379428&distance=100&pagenum=1&per_page=25",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/en/jobs/\\d+-"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "munich_electrification",
+            "url": "https://www.munichelectrification.com/career?ashby_department_id=77276da4-adaa-4d81-8154-e5b7411d0762",
+            "site_type": "ashby",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "ashby_jid="
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "siemens",
+            "url": "https://jobs.siemens.com/en_US/externaljobs/SearchJobs/software?42386=%5B812132%5D&42386_format=17546&42389=%5B102127%2C102117%5D&42389_format=17549&42390=%5B102155%2C102156%2C102157%2C102158%5D&42390_format=17550&listFilterMode=1&folderRecordsPerPage=6&",
+            "site_type": "siemens",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/en_US/externaljobs/JobDetail/\\d+"
+            ],
+            "require_keyword": false
+        },
+    {
+      "name": "nxp",
+      "url": "https://nxp.wd3.myworkdayjobs.com/careers?timeType=b203892f10e6100cb5b7230247fcadba&Location_Country=dcc5b7608d8644b3a93716604e78e995",
+      "site_type": "workday",
+      "filters": {},
+      "apply_filters": false,
+      "job_link_patterns": [
+        "myworkdayjobs\\.com/.*/careers/job/",
+        "/careers/job/"
+      ],
+      "require_keyword": false
+    },
+    {
+      "name": "airbus",
+      "url": "https://ag.wd3.myworkdayjobs.com/Airbus?q=software&locationCountry=dcc5b7608d8644b3a93716604e78e995&jobFamilyGroup=f5811cef9cb5018463377f3f550a1bf2",
+      "site_type": "workday",
+      "workday_site_id": "Airbus",
+      "filters": {},
+      "apply_filters": false,
+      "job_link_patterns": [
+        "myworkdayjobs\\.com/.*/careers/job/",
+        "/careers/job/"
+      ],
+      "require_keyword": false
+    },
+        {
+            "name": "hensoldt",
+            "url": "https://jobs.hensoldt.net/search/?createNewAlert=false&q=software&optionsFacetsDD_country=DE&optionsFacetsDD_location=&optionsFacetsDD_customfield2=Engineering&optionsFacetsDD_customfield1=Professionals&optionsFacetsDD_customfield3=&optionsFacetsDD_department=",
+            "site_type": "hensoldt",
+            "filters": {},
+            "apply_filters": false,
+            "require_keyword": false
+        },
+        {
+            "name": "rohde_schwarz",
+            "url": "https://www.rohde-schwarz.com/de/karriere/stellenangebote/karriere-stellenangebote_251573.html?term=software&filter%5B_facet.field_of_work%5D%5B%5D=Software-Entwicklung&filter%5B_raw.country%5D%5B%5D=Deutschland&filter%5B_raw.city%5D%5B%5D=Memmingen&filter%5B_raw.city%5D%5B%5D=M%C3%BCnchen&filter%5B_raw.city%5D%5B%5D=Stuttgart&filter%5B_raw.city%5D%5B%5D=Teisnach#jobBoard",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "stellenangebot-detailansicht_\\d+-\\d+\\.html"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "aconext",
+            "url": "https://aconext.de/jobs/?search-job=software&job-employment-type=vollzeit&button=submit",
+            "filters": {},
+            "apply_filters": false,
+            "job_link_patterns": [
+                "/jobs/"
+            ],
+            "require_keyword": false
+        },
+        {
+            "name": "bertrandt",
+            "url": "https://bertrandtgroup.onlyfy.jobs/",
+            "filters": {
+                "type to search": ["software"],
+                "country": ["de"],
+                "position type": ["full-time employee"],
+                "city": ["ingolstadt"],
+                "search radius": ["100"]
+            },
+            "job_link_patterns": [
+                "/job/[a-z0-9]+"
+            ],
+            "require_keyword": false
+        }
+    ]
+}

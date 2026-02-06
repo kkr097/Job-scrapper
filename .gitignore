@@ -20,3 +20,8 @@ config.json
 # OS files
 .DS_Store
 Thumbs.db
+
+*/*.csv
+.env
+*/*.log
+*/*.ps1
