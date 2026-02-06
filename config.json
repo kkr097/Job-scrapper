@@ -115,7 +115,7 @@
     "linkedin_delay_max": 5,
     "linkedin_use_playwright": true,
     "linkedin_print_links": true,
-    "company_careers_test_only": [],
+    "company_careers_test_only": ["zeiss"],
     "output": {
         "excel_file": "daily_jobs.csv"
     }
