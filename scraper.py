@@ -201,7 +201,37 @@ class JobScraper:
                                     print(f"   â€¢ LinkedIn link: {j['url']}")
                         self._linkedin_delay()
 
-        # 2. Arbeitnow (Germany-focused, scraper-friendly)
+        # 2. XING (public search)
+        if self.sources.get('xing', False):
+            print("\nðŸ“Œ Scraping XING...")
+            xing_url = self.config.get("xing_search_url", "").strip()
+            xing_urls = self.config.get("xing_search_urls", []) or []
+            xing_urls = [u for u in xing_urls if isinstance(u, str) and u.strip()]
+            if xing_url:
+                xing_urls = [xing_url] + xing_urls
+            if xing_urls:
+                use_playwright = bool(self.config.get("xing_use_playwright", True))
+                for custom_url in xing_urls:
+                    if use_playwright and sync_playwright:
+                        jobs = self._scrape_xing_playwright(base_url=custom_url)
+                    else:
+                        jobs = self._scrape_xing(base_url=custom_url)
+                    all_jobs.extend(jobs)
+                    print(f"   XING custom URL: {len(jobs)} jobs")
+                    if not jobs:
+                        self._log_event("zero_results", {
+                            "source": "xing",
+                            "company": "",
+                            "url": custom_url,
+                            "details": "No jobs returned"
+                        })
+                    if self.config.get("xing_print_links", False):
+                        for j in jobs:
+                            if j.get("url"):
+                                print(f"   â€¢ XING link: {j['url']}")
+                    self._linkedin_delay()
+
+        # 3. Arbeitnow (Germany-focused, scraper-friendly)
         if self.sources.get('arbeitnow', True):
             print("\nðŸ“Œ Scraping Arbeitnow...")
             jobs = self._scrape_arbeitnow()
@@ -215,7 +245,7 @@ class JobScraper:
                     "details": "No jobs returned"
                 })
         
-        # 3. SimplyHired (alternative aggregator)
+        # 4. SimplyHired (alternative aggregator)
         if self.sources.get('simplyhired', True):
             print("\nðŸ“Œ Scraping SimplyHired...")
             for keyword in self.keywords[:3]:  # Limit to top 3 keywords
@@ -232,7 +262,7 @@ class JobScraper:
                         })
                     self._linkedin_delay()
 
-        # 4. Direct company career pages (Playwright-only)
+        # 5. Direct company career pages (Playwright-only)
         if self.sources.get('company_careers', False):
             print("\nðŸ“Œ Scraping company career pages (Playwright)...")
             jobs = self._scrape_company_careers_playwright()
@@ -455,6 +485,175 @@ class JobScraper:
             }
         except:
             return None
+
+    def _scrape_xing(self, base_url: str) -> List[Dict]:
+        """Scrape XING public job search (basic, list-page only)."""
+        jobs = []
+        try:
+            response = requests.get(base_url, headers=self._get_headers(), timeout=15)
+            if response.status_code != 200:
+                self._log_failed_request("xing", base_url, f"status={response.status_code}")
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'lxml')
+
+            # Prefer anchors that look like job detail links
+            anchors = soup.find_all('a', href=re.compile(r'/jobs/'))
+            if anchors:
+                for a in anchors:
+                    href = a.get('href', '').strip()
+                    if not href:
+                        continue
+                    if "/jobs/search" in href or "/jobs/directory" in href:
+                        continue
+                    if not re.search(r"/jobs/[^/?]+-\d+", href):
+                        continue
+                    url = href if href.startswith("http") else "https://www.xing.com" + href
+                    title = (
+                        a.get_text(strip=True)
+                        or a.get("title")
+                        or a.get("aria-label")
+                        or None
+                    )
+                    if not title:
+                        continue
+                    # Try to find nearby company/location info
+                    card = a.find_parent(['article', 'div']) or a.parent
+                    company_elem = card.find(['span', 'div'], class_=re.compile(r'company|employer', re.IGNORECASE)) if card else None
+                    company = company_elem.get_text(strip=True) if company_elem else "Unknown"
+                    loc_elem = card.find(['span', 'div'], class_=re.compile(r'location|city', re.IGNORECASE)) if card else None
+                    location = loc_elem.get_text(strip=True) if loc_elem else ""
+
+                    job = {
+                        'title': title,
+                        'company': company,
+                        'location': location,
+                        'url': url,
+                        'source': 'XING',
+                        'date_found': datetime.now().isoformat()
+                    }
+                    if not self._should_exclude(job):
+                        jobs.append(job)
+                        self._emit_job(job)
+                    self._random_delay()
+            else:
+                # Fallback: XING job cards (best-effort selectors)
+                cards = soup.find_all(['article', 'div'], class_=re.compile(r'job|result|card', re.IGNORECASE))
+                for card in cards:
+                    title_elem = card.find(['h2', 'h3', 'a'])
+                    title = title_elem.get_text(strip=True) if title_elem else None
+                    if not title:
+                        continue
+                    company_elem = card.find(['span', 'div'], class_=re.compile(r'company|employer', re.IGNORECASE))
+                    company = company_elem.get_text(strip=True) if company_elem else "Unknown"
+                    loc_elem = card.find(['span', 'div'], class_=re.compile(r'location|city', re.IGNORECASE))
+                    location = loc_elem.get_text(strip=True) if loc_elem else ""
+                    link = card.find('a', href=True)
+                    url = link['href'] if link else ""
+                    if "/jobs/search" in url or "/jobs/directory" in url:
+                        continue
+                    if not re.search(r"/jobs/[^/?]+-\d+", url):
+                        continue
+                    if url.startswith("/"):
+                        url = "https://www.xing.com" + url
+
+                    job = {
+                        'title': title,
+                        'company': company,
+                        'location': location,
+                        'url': url,
+                        'source': 'XING',
+                        'date_found': datetime.now().isoformat()
+                    }
+                    if not self._should_exclude(job):
+                        jobs.append(job)
+                        self._emit_job(job)
+                    self._random_delay()
+        except Exception as e:
+            print(f"   âš  XING error: {e}")
+            self._log_failed_request("xing", base_url, f"error={e}")
+        return jobs
+
+    def _scrape_xing_playwright(self, base_url: str) -> List[Dict]:
+        """Scrape XING job search using Playwright to click 'Show more'."""
+        jobs = []
+        if not sync_playwright:
+            return self._scrape_xing(base_url=base_url)
+
+        max_clicks = int(self.config.get("xing_max_clicks", 25))
+        headless = bool(self.config.get("xing_headless", True))
+        show_more_selector = "button:has-text('Show more'), span:has-text('Show more')"
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                page = browser.new_page()
+                page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
+
+                stagnant = 0
+                for _ in range(max_clicks):
+                    try:
+                        page.wait_for_timeout(1200)
+                        # Scroll to bottom to trigger lazy load
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(1200)
+
+                        before = page.locator("a[href*='/jobs/']").count()
+                        if page.locator(show_more_selector).count() == 0:
+                            break
+                        page.locator(show_more_selector).first.click(timeout=5000)
+                        page.wait_for_timeout(1500)
+                        after = page.locator("a[href*='/jobs/']").count()
+                        if after <= before:
+                            stagnant += 1
+                            if stagnant >= 2:
+                                break
+                        else:
+                            stagnant = 0
+                    except Exception:
+                        break
+
+                html = page.content()
+                soup = BeautifulSoup(html, 'lxml')
+                anchors = soup.find_all('a', href=re.compile(r'/jobs/'))
+                for a in anchors:
+                    href = a.get('href', '').strip()
+                    if not href:
+                        continue
+                    if "/jobs/search" in href or "/jobs/directory" in href:
+                        continue
+                    if not re.search(r"/jobs/[^/?]+-\d+", href):
+                        continue
+                    url = href if href.startswith("http") else "https://www.xing.com" + href
+                    title = (
+                        a.get_text(strip=True)
+                        or a.get("title")
+                        or a.get("aria-label")
+                        or None
+                    )
+                    if not title:
+                        continue
+                    card = a.find_parent(['article', 'div']) or a.parent
+                    company_elem = card.find(['span', 'div'], class_=re.compile(r'company|employer', re.IGNORECASE)) if card else None
+                    company = company_elem.get_text(strip=True) if company_elem else "Unknown"
+                    loc_elem = card.find(['span', 'div'], class_=re.compile(r'location|city', re.IGNORECASE)) if card else None
+                    location = loc_elem.get_text(strip=True) if loc_elem else ""
+
+                    job = {
+                        'title': title,
+                        'company': company,
+                        'location': location,
+                        'url': url,
+                        'source': 'XING',
+                        'date_found': datetime.now().isoformat()
+                    }
+                    if not self._should_exclude(job):
+                        jobs.append(job)
+                        self._emit_job(job)
+                browser.close()
+        except Exception as e:
+            print(f"   ⚠ XING error (playwright): {e}")
+            self._log_failed_request("xing", base_url, f"playwright_error={e}")
+        return jobs
     
     def _scrape_arbeitnow(self) -> List[Dict]:
         """Scrape Arbeitnow - Germany-focused job board with API."""
