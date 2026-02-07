@@ -5,7 +5,6 @@ Supports: DeepSeek (free), Gemini, Groq, or local Ollama.
 
 import json
 import time
-import os
 from typing import List, Dict
 
 import requests
@@ -14,8 +13,8 @@ import requests
 class JobRater:
     """Rate jobs against resume using AI (DeepSeek, Gemini, or Groq)."""
     
-    def __init__(self, config: dict, resume_summary: str):
-        self.resume_summary = resume_summary
+    def __init__(self, config: dict, candidate_profile: dict):
+        self.candidate_profile = candidate_profile
         self.config = config
         
         # Determine which API to use
@@ -69,7 +68,9 @@ class JobRater:
             print(f"   Rating jobs {i+1}-{min(i+batch_size, len(jobs))}...")
             
             try:
-                rated_batch = self._rate_batch(batch)
+                rated_batch = []
+                for job in batch:
+                    rated_batch.append(self._rate_one(job))
                 rated.extend(rated_batch)
                 
                 # Rate limit delay
@@ -91,32 +92,87 @@ class JobRater:
         
         return rated
     
-    def _rate_batch(self, jobs: List[Dict]) -> List[Dict]:
-        """Rate a batch of jobs with AI."""
-        
-        # Build job list (compact format)
-        job_list = ""
-        for idx, job in enumerate(jobs, 1):
-            job_list += f"{idx}. {job['title']} at {job['company']}\n"
-        
-        # Use a shorter resume summary to fit token limits
-        short_summary = self.resume_summary[:1500] if len(self.resume_summary) > 1500 else self.resume_summary
-        
-        prompt = f"""Rate these jobs against the candidate and keyword rules.
+    def _rate_one(self, job: Dict) -> Dict:
+        """Rate a single job with AI."""
+        desc = (job.get("description") or "").strip()
+        if len(desc) > 2000:
+            desc = desc[:2000] + "..."
+        job_text = "\n".join([
+            f"Title: {job.get('title','')}",
+            f"Company: {job.get('company','')}",
+            f"Location: {job.get('location','')}",
+            f"URL: {job.get('url','')}",
+            f"Description: {desc}"
+        ])
 
-Candidate summary:
-{short_summary}
+        candidate_json = json.dumps(self.candidate_profile, ensure_ascii=False)
 
-Positive keywords (should match): {', '.join(self.config.get('include_description_keywords', []))}
-Negative keywords (should penalize): {', '.join(self.config.get('exclude_description_keywords', []))}
-Negative title keywords (should penalize if present): {', '.join(self.config.get('exclude_keywords', []))}
+        prompt = f"""### ROLE
+Expert Technical Talent Matcher (Automotive & Embedded Systems).
 
-JOBS:
-{job_list}
-Score 1-10 (10=strong match, 1=wrong field).
+### SYSTEM INSTRUCTIONS
+Evaluate the [CANDIDATE_PROFILE] against the [JOB_DESCRIPTION] provided.
+Follow the [SCORING_PROTOCOL] strictly.
+Perform a "Step-by-Step Gap Analysis" before assigning the final score to ensure accuracy.
 
-Return ONLY JSON:
-{{"ratings": [{{"job": 1, "score": 8, "reasons": "keyword match", "missing": "missing key skills"}}, {{"job": 2, "score": 3, "reasons": "negative keywords", "missing": "wrong field"}}]}}"""
+---
+
+### CANDIDATE_PROFILE (JSON Data)
+{candidate_json}
+
+---
+
+### JOB_DESCRIPTION (Extracted Text)
+{job_text}
+
+---
+
+### SCORING_PROTOCOL (Ruleset)
+1. **Technical Core (Match Weight: 50%):**
+   - Must prioritize: C, C++, MATLAB/Simulink, TargetLink, ASPICE, V-Model.
+   - Secondary: Python, CI/CD, Git, Unit Testing (cmocka).
+
+2. **Domain Alignment (Match Weight: 30%):**
+   - Positive Domains: Automotive, Medical Engineering, Robotics, Control Systems.
+   - Positive Standards: ISO 26262, AUTOSAR, MISRA.
+
+3. **Seniority & Role Fit (Penalty Weight: 20%):**
+   - Candidate has ~4 years professional/academic experience (Mid-level).
+   - APPLY HARD PENALTY (Score < 3) if the job is:
+     - Pure Management: (Lead, Manager, Director, Projektleiter, Owner).
+     - Wrong Tech Stack: (Cloud, DevOps, Java, Web, Fullstack, SAP, PLC/SPS).
+     - Entry Level: (Intern, Praktikant, Masterarbeit, Student).
+
+---
+
+### EVALUATION STEPS
+1. **Extraction:** List the top 5 technical requirements from the Job Description.
+2. **Comparison:** Identify which of these the candidate possesses.
+3. **Red Flag Check:** Scan for negative title keywords and non-embedded tech stacks.
+4. **Scoring:** Calculate the 1-10 score based on weights above.
+
+---
+
+### OUTPUT FORMAT (Strict JSON)
+{{
+  "analysis": {{
+    "extracted_requirements": ["list 5 key skills found in job"],
+    "matching_skills": ["list candidate's overlapping skills"],
+    "missing_skills": ["list key job requirements candidate lacks"],
+    "red_flags": ["list any negative keywords or title mismatches found"]
+  }},
+  "scoring_breakdown": {{
+    "tech_score": "1-10",
+    "domain_score": "1-10",
+    "fit_score": "1-10",
+    "final_weighted_score": 0
+  }},
+  "verdict": "Short explanation of why the candidate is or isn't a match."
+}}
+
+### INPUT DATA
+JOBS TO EVALUATE:
+{job_text}"""
 
         # Call the appropriate API
         if self.api_type == 'deepseek':
@@ -125,14 +181,13 @@ Return ONLY JSON:
             result = self._call_best_model(prompt)
         else:
             result = None
-        
+
         if not result:
-            for job in jobs:
-                job['score'] = 5
-                job['match_reasons'] = 'API call failed'
-                job['missing_skills'] = ''
-            return jobs
-        
+            job['score'] = 5
+            job['match_reasons'] = 'API call failed'
+            job['missing_skills'] = ''
+            return job
+
         # Parse JSON response
         try:
             json_str = result
@@ -144,31 +199,30 @@ Return ONLY JSON:
                 start = result.find("```") + 3
                 end = result.find("```", start)
                 json_str = result[start:end].strip()
-            
-            ratings = json.loads(json_str)
-            
-            for rating in ratings.get('ratings', []):
-                idx = rating.get('job', 1) - 1
-                if 0 <= idx < len(jobs):
-                    jobs[idx]['score'] = rating.get('score', 5)
-                    jobs[idx]['match_reasons'] = rating.get('reasons', '')
-                    jobs[idx]['missing_skills'] = rating.get('missing', '')
-            
-            for job in jobs:
-                if 'score' not in job:
-                    job['score'] = 5
-                    job['match_reasons'] = ''
-                    job['missing_skills'] = ''
-            
-            return jobs
-            
+
+            payload = json.loads(json_str)
+            breakdown = payload.get("scoring_breakdown", {})
+            score = breakdown.get("final_weighted_score", 5)
+            try:
+                score = float(score)
+            except Exception:
+                score = 5
+
+            job['score'] = score
+            job['match_reasons'] = payload.get("verdict", "")
+            missing = payload.get("analysis", {}).get("missing_skills", [])
+            if isinstance(missing, list):
+                job['missing_skills'] = ", ".join(missing)
+            else:
+                job['missing_skills'] = str(missing or "")
+            return job
+
         except Exception as e:
             print(f"   JSON parse error: {e}")
-            for job in jobs:
-                job['score'] = 5
-                job['match_reasons'] = 'Parse error'
-                job['missing_skills'] = ''
-            return jobs
+            job['score'] = 5
+            job['match_reasons'] = 'Parse error'
+            job['missing_skills'] = ''
+            return job
     
     def _call_deepseek(self, prompt: str) -> str:
         """Call DeepSeek API."""

@@ -9,9 +9,10 @@ import re
 import os
 import json
 import hashlib
+import math
 import time
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Dict, Optional
 from urllib.parse import urlencode, quote_plus, urljoin, urlparse, parse_qs, urlunparse
 
@@ -25,41 +26,6 @@ except Exception:
     sync_playwright = None
 
 
-# German automotive companies with their career page patterns
-GERMAN_AUTOMOTIVE_COMPANIES = [
-    {
-        'name': 'BMW',
-        'url': 'https://www.bmwgroup.jobs/de/de/jobfinder.html?keywords={keyword}',
-        'pattern': 'automotive',
-    },
-    {
-        'name': 'Mercedes-Benz',
-        'url': 'https://jobs.mercedes-benz.com/de/de/search-results?keywords={keyword}',
-        'pattern': 'automotive',
-    },
-    {
-        'name': 'Volkswagen',
-        'url': 'https://www.volkswagen-karriere.de/de/stellensuche.html?search={keyword}',
-        'pattern': 'automotive',
-    },
-    {
-        'name': 'Bosch',
-        'url': 'https://www.bosch.de/karriere/stellensuche/?keywords={keyword}&country=DE',
-        'pattern': 'automotive',
-    },
-    {
-        'name': 'Continental',
-        'url': 'https://jobs.continental.com/en/search-results?keywords={keyword}',
-        'pattern': 'automotive',
-    },
-    {
-        'name': 'ZF Friedrichshafen',
-        'url': 'https://jobs.zf.com/go/All-open-positions/8769601/?q={keyword}',
-        'pattern': 'automotive',
-    },
-]
-
-
 class JobScraper:
     """Scrapes job postings from multiple sources."""
     
@@ -71,13 +37,14 @@ class JobScraper:
     
     def __init__(self, config: dict):
         self.config = config
-        self.keywords = config['search']['keywords']
-        self.location = config['search']['location']
+        search_cfg = config.get('search', {})
+        self.keywords = search_cfg.get('keywords', [])
+        self.location = search_cfg.get('location', [])
         if isinstance(self.location, list):
             self.locations = self.location
         else:
             self.locations = [self.location]
-        self.max_days = config['search'].get('max_days_old', 2)
+        self.max_days = search_cfg.get('max_days_old', 2)
         self.exclude = config.get('exclude_keywords', [])
         self.exclude_desc = config.get('exclude_description_keywords', [])
         self.include_desc = config.get('include_description_keywords', [])
@@ -91,9 +58,13 @@ class JobScraper:
         }
         self._on_job = None
     
-    def _get_headers(self) -> dict:
+    def _get_headers(self, source: Optional[str] = None) -> dict:
+        if source == "linkedin":
+            ua = self.config.get("linkedin_user_agent") or self.USER_AGENTS[0]
+        else:
+            ua = random.choice(self.USER_AGENTS)
         return {
-            'User-Agent': random.choice(self.USER_AGENTS),
+            'User-Agent': ua,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5,de;q=0.3',
         }
@@ -104,6 +75,11 @@ class JobScraper:
     def _linkedin_delay(self):
         min_sec = float(self.config.get("linkedin_delay_min", 5))
         max_sec = float(self.config.get("linkedin_delay_max", 5))
+        time.sleep(random.uniform(min_sec, max_sec))
+
+    def _linkedin_card_delay(self):
+        min_sec = float(self.config.get("linkedin_card_delay_min", 0.8))
+        max_sec = float(self.config.get("linkedin_card_delay_max", 2.0))
         time.sleep(random.uniform(min_sec, max_sec))
 
     def _log_event(self, kind: str, payload: Dict) -> None:
@@ -178,36 +154,38 @@ class JobScraper:
         all_jobs = []
         started = time.time()
         
-        # 1. LinkedIn (most reliable)
+        # 1. LinkedIn (public guest search only)
         if self.sources.get('linkedin', True):
             print("\nðŸ“Œ Scraping LinkedIn...")
             linkedin_url = self.config.get("linkedin_search_url", "").strip()
-            use_playwright = bool(self.config.get("linkedin_use_playwright", False))
+            linkedin_urls = self.config.get("linkedin_search_urls", []) or []
+            linkedin_urls = [u for u in linkedin_urls if isinstance(u, str) and u.strip()]
             if linkedin_url:
-                if use_playwright:
-                    jobs = self._scrape_linkedin_playwright(base_url=linkedin_url)
-                else:
-                    jobs = self._scrape_linkedin(None, None, base_url=linkedin_url)
-                all_jobs.extend(jobs)
-                print(f"   LinkedIn custom URL: {len(jobs)} jobs")
-                if not jobs:
-                    self._log_event("zero_results", {
-                        "source": "linkedin",
-                        "company": "",
-                        "url": linkedin_url,
-                        "details": "No jobs returned"
-                    })
-                if self.config.get("linkedin_print_links", False):
-                    for j in jobs:
-                        if j.get("url"):
-                            print(f"   â€¢ LinkedIn link: {j['url']}")
+                linkedin_urls = [linkedin_url] + linkedin_urls
+            use_playwright = bool(self.config.get("linkedin_use_playwright", False))
+            if use_playwright:
+                print("   âš  Playwright disabled for LinkedIn. Using public guest search only.")
+            if linkedin_urls:
+                for custom_url in linkedin_urls:
+                    jobs = self._scrape_linkedin(None, None, base_url=custom_url)
+                    all_jobs.extend(jobs)
+                    print(f"   LinkedIn custom URL: {len(jobs)} jobs")
+                    if not jobs:
+                        self._log_event("zero_results", {
+                            "source": "linkedin",
+                            "company": "",
+                            "url": custom_url,
+                            "details": "No jobs returned"
+                        })
+                    if self.config.get("linkedin_print_links", False):
+                        for j in jobs:
+                            if j.get("url"):
+                                print(f"   â€¢ LinkedIn link: {j['url']}")
+                    self._linkedin_delay()
             else:
                 for keyword in self.keywords:
                     for location in self.locations:
-                        if use_playwright:
-                            jobs = self._scrape_linkedin_playwright(keyword=keyword, location=location)
-                        else:
-                            jobs = self._scrape_linkedin(keyword, location)
+                        jobs = self._scrape_linkedin(keyword, location)
                         all_jobs.extend(jobs)
                         print(f"   {keyword} ({location}): {len(jobs)} jobs")
                         if not jobs:
@@ -276,46 +254,111 @@ class JobScraper:
                 pass
     
     def _scrape_linkedin(self, keyword: Optional[str], location: Optional[str], base_url: Optional[str] = None) -> List[Dict]:
-        """Scrape LinkedIn public job search."""
+        """Scrape LinkedIn public guest search (logged-out)."""
         jobs = []
+        # Guest search endpoint (no auth, no cookies)
         if base_url:
-            url = base_url
+            url = self._normalize_linkedin_guest_url(base_url)
         else:
             keyword_enc = quote_plus(keyword or "")
             location_enc = quote_plus(location or "")
-            url = f"https://www.linkedin.com/jobs/search?keywords={keyword_enc}&location={location_enc}&f_TPR=r172800"
+            url = (
+                "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+                f"?keywords={keyword_enc}&location={location_enc}&f_TPR=r172800"
+            )
         max_pages = int(self.config.get("linkedin_max_pages", 20))
         page_size = int(self.config.get("linkedin_page_size", 25))
+        fetch_all = bool(self.config.get("linkedin_fetch_all", False))
+        scroll_step = int(self.config.get("linkedin_scroll_step", page_size))
+        if scroll_step <= 0:
+            scroll_step = page_size
+
+        def _extract_total_jobs(soup: BeautifulSoup) -> Optional[int]:
+            # Try specific counters first
+            count_el = soup.find(class_=re.compile(r"(job-count|results-count|results-context-header__job-count)"))
+            if count_el:
+                m = re.search(r"(\d[\d,\.]*)", count_el.get_text(" ", strip=True))
+                if m:
+                    return int(m.group(1).replace(",", "").replace(".", ""))
+            # Fallback: scan text for "jobs"
+            text = soup.get_text(" ", strip=True)
+            m = re.search(r"(\d[\d,\.]*)\s+jobs?\b", text, re.IGNORECASE)
+            if m:
+                return int(m.group(1).replace(",", "").replace(".", ""))
+            return None
         
         try:
-            for page in range(max_pages):
-                start = page * page_size
+            if fetch_all and max_pages < 10:
+                max_pages = 10
+            seen_urls = set()
+            empty_pages = 0
+            total_items = max_pages * page_size
+            start_values = list(range(0, total_items, scroll_step))
+            for start in start_values:
                 parsed = urlparse(url)
                 qs = parse_qs(parsed.query)
                 qs["start"] = [str(start)]
+                qs["count"] = [str(page_size)]
                 page_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
-                response = requests.get(page_url, headers=self._get_headers(), timeout=15)
+                response = requests.get(page_url, headers=self._get_headers("linkedin"), timeout=15, cookies={})
                 if response.status_code != 200:
                     self._log_failed_request("linkedin", page_url, f"status={response.status_code}")
                 response.raise_for_status()
                 soup = BeautifulSoup(response.text, 'lxml')
+                if start == 0 and (fetch_all or max_pages <= 0):
+                    total = _extract_total_jobs(soup)
+                    if total:
+                        max_pages = max(1, math.ceil(total / page_size))
+                        total_items = max_pages * page_size
+                        start_values = list(range(0, total_items, scroll_step))
 
-                cards = soup.find_all('div', class_=re.compile(r'base-card|job-search-card'))
+                cards = soup.find_all(class_=re.compile(r'base-card|job-search-card|result-card|job-result-card'))
                 if not cards:
                     break
 
+                new_found = 0
                 for card in cards:
                     job = self._parse_linkedin_card(card)
                     if job and not self._should_exclude(job):
+                        url_l = (job.get("url") or "").lower()
+                        if url_l and url_l in seen_urls:
+                            continue
+                        if url_l:
+                            seen_urls.add(url_l)
                         jobs.append(job)
                         self._emit_job(job)
-                self._random_delay()
+                        new_found += 1
+                    self._linkedin_card_delay()
+                if new_found == 0:
+                    empty_pages += 1
+                    if empty_pages >= 3:
+                        break
+                else:
+                    empty_pages = 0
+                # Slow down between pages to mimic human scrolling pace
+                self._linkedin_delay()
                     
         except Exception as e:
             print(f"   âš  LinkedIn error: {e}")
             self._log_failed_request("linkedin", url, f"error={e}")
         
         return jobs
+
+    def _normalize_linkedin_guest_url(self, url: str) -> str:
+        """Convert a LinkedIn jobs search URL into the logged-out guest endpoint."""
+        parsed = urlparse(url)
+        if "jobs-guest/jobs/api/seeMoreJobPostings/search" in parsed.path:
+            return url
+        qs = parse_qs(parsed.query)
+        # Drop params that can conflict with pagination
+        for k in ["pageNum", "position", "currentJobId", "start", "count"]:
+            qs.pop(k, None)
+        return urlunparse(parsed._replace(
+            scheme="https",
+            netloc="www.linkedin.com",
+            path="/jobs-guest/jobs/api/seeMoreJobPostings/search",
+            query=urlencode(qs, doseq=True)
+        ))
 
     def _scrape_linkedin_playwright(
         self,
@@ -368,7 +411,7 @@ class JobScraper:
                 except Exception:
                     break
                 soup = BeautifulSoup(html, 'lxml')
-                cards = soup.find_all('div', class_=re.compile(r'base-card|job-search-card'))
+                cards = soup.find_all(class_=re.compile(r'base-card|job-search-card|result-card|job-result-card'))
                 if not cards:
                     break
                 for card in cards:
@@ -383,16 +426,24 @@ class JobScraper:
     
     def _parse_linkedin_card(self, card) -> Optional[Dict]:
         try:
-            title_elem = card.find('h3', class_=re.compile(r'base-search-card__title'))
+            title_elem = card.find(['h3', 'span'], class_=re.compile(
+                r'base-search-card__title|result-card__title|job-search-card__title'
+            ))
             title = title_elem.get_text(strip=True) if title_elem else None
             
-            company_elem = card.find('h4', class_=re.compile(r'base-search-card__subtitle'))
+            company_elem = card.find(['h4', 'span'], class_=re.compile(
+                r'base-search-card__subtitle|result-card__subtitle|job-search-card__subtitle'
+            ))
             company = company_elem.get_text(strip=True) if company_elem else "Unknown"
             
-            loc_elem = card.find('span', class_=re.compile(r'job-search-card__location'))
+            loc_elem = card.find('span', class_=re.compile(
+                r'job-search-card__location|result-card__location'
+            ))
             location = loc_elem.get_text(strip=True) if loc_elem else self.locations[0]
             
-            link = card.find('a', class_=re.compile(r'base-card__full-link'))
+            link = card.find('a', class_=re.compile(
+                r'base-card__full-link|result-card__full-card-link|job-result-card__full-card-link|result-card__full-link'
+            ))
             url = link.get('href', '').split('?')[0] if link else ""
             
             if not title:

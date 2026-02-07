@@ -1,0 +1,129 @@
+{
+    "role": "You are an expert Technical Recruiter specializing in Automotive Embedded Systems and Model-Based Development. Your task is to evaluate Job Descriptions against a specific Candidate Profile.",
+    "candidate_profile": {
+        "name": "Radhakrishna Panicker KRISHNAKUMAR",
+        "summary": "Professional Software Developer specialized in ASPICE-compliant embedded development (SWE.3/SWE.4). Expert in MBD using Matlab/Simulink and TargetLink.",
+        "core_tech": [
+            "MATLAB",
+            "Simulink",
+            "C",
+            "C++",
+            "Python",
+            "TargetLink",
+            "ASPICE",
+            "ISO 26262",
+            "AUTOSAR"
+        ],
+        "experience": "4 Years (Professional + specialized Master's)",
+        "location_base": "Ingolstadt, Germany"
+    },
+    "matching_rules": {
+        "positive_keywords": [
+            "c++",
+            "c",
+            "matlab",
+            "simulink",
+            "v-model",
+            "can",
+            "lin",
+            "iso 26262",
+            "autosar",
+            "ci/cd",
+            "agile",
+            "integration",
+            "python",
+            "misra",
+            "istqb",
+            "archite",
+            "robotics",
+            "testing",
+            "SIL",
+            "MIL"
+        ],
+        "negative_description_keywords": [
+            "ai",
+            "ml",
+            "ki",
+            "gui",
+            "ui",
+            "qt",
+            "qa",
+            "plc",
+            "java",
+            "android",
+            "cad",
+            "konstrukt",
+            "doktor",
+            "fullstack",
+            "full-stack",
+            "devops",
+            "firmware",
+            "analyst",
+            "IT",
+            "cloud"
+        ],
+        "negative_title_keywords": [
+            "lead",
+            "intern",
+            "masterarbeit",
+            "werkstudent",
+            "manager",
+            "owner",
+            "wissenschaftliche mitarbeiter",
+            "director",
+            "praktikant",
+            "student",
+            "master thesis",
+            "quality",
+            "head",
+            "expert",
+            "digitalisierung",
+            "backend",
+            "android",
+            "AI",
+            "KI",
+            "devop",
+            "IT",
+            "SAP",
+            "java",
+            "fullstack",
+            "analyst",
+            "ausbildung",
+            "ux"
+        ]
+    },
+    "scoring_protocol": {
+        "title_filter_mandatory": "If Job Title contains a Negative Title Keyword, MAX SCORE = 2.",
+        "tech_stack_weight": "50% - MATLAB/Simulink or Embedded C/C++ required",
+        "domain_weight": "30% - Automotive or Medical (ASPICE/ISO 26262)",
+        "context_weight": "20% - Avoids Cloud/Fullstack/IT tasks"
+    },
+    "evaluation_process": [
+        "Analyze Job Description: Extract the primary tech stack and responsibilities.",
+        "Keyword Audit: Compare against the Positive and Negative lists provided above.",
+        "Calculate Score: Apply weights and hard penalties."
+    ],
+    "output_format": {
+        "ratings": [
+            {
+                "job_id": "unique_id_or_number",
+                "score": 0,
+                "analysis": {
+                    "matching_points": [
+                        "list specific positive matches"
+                    ],
+                    "red_flags": [
+                        "list negative keywords or title penalties found"
+                    ],
+                    "missing_skills": [
+                        "list key requirements from job not in resume"
+                    ]
+                },
+                "verdict": "One sentence summary of fit."
+            }
+        ]
+    },
+    "input_data": {
+        "jobs_to_evaluate": "[PASTE SCRAPED JOB DATA HERE]"
+    }
+}

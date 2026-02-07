@@ -21,8 +21,8 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scraper import JobScraper
-from exporter import export_to_excel, append_new_to_excel, append_new_to_csv, load_existing_urls, load_cache, save_cache, prune_cache
-from resume_parser import get_resume_summary, generate_config_from_resume
+from exporter import append_new_to_excel, append_new_to_csv, load_existing_urls, load_cache, save_cache, prune_cache
+from resume_parser import get_resume_summary, generate_config_from_resume, parse_resume
 
 
 def _deep_update(base: dict, override: dict) -> dict:
@@ -62,7 +62,8 @@ def load_config(force_regen: bool = False):
     """Load configuration from config.json, generate it from resume if missing."""
     config_path = os.path.join(os.path.dirname(__file__), 'config.json')
     env_path = os.path.join(os.path.dirname(__file__), '.env')
-    load_dotenv(env_path)
+    # Ensure .env values override any pre-set shell environment variables.
+    load_dotenv(env_path, override=True)
     if force_regen or not os.path.exists(config_path):
         print("   âš  config.json not found. Generating from resume PDF...")
         defaults = _load_defaults()
@@ -85,9 +86,13 @@ def load_config(force_regen: bool = False):
 
 def _load_pending_rows(path: str) -> list:
     if not os.path.exists(path):
+        print(f"   ⚠ CSV not found: {path}")
         return []
     with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    if not rows:
+        print(f"   ⚠ CSV empty: {path}")
+    return rows
 
 
 def _load_pending_urls(path: str) -> set:
@@ -102,7 +107,7 @@ def _load_pending_urls(path: str) -> set:
 def _append_pending_row(path: str, row: dict) -> None:
     write_header = not os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["url", "title", "company", "source", "first_seen"])
+        writer = csv.DictWriter(f, fieldnames=["url", "title", "company", "source", "first_seen", "description"])
         if write_header:
             writer.writeheader()
         writer.writerow(row)
@@ -115,7 +120,7 @@ def _remove_pending_url(path: str, url: str) -> None:
     rows = _load_pending_rows(path)
     rows = [r for r in rows if (r.get("url") or "").strip().lower() != url_l]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["url", "title", "company", "source", "first_seen"])
+        writer = csv.DictWriter(f, fieldnames=["url", "title", "company", "source", "first_seen", "description"])
         writer.writeheader()
         writer.writerows(rows)
 
@@ -186,19 +191,82 @@ def main():
     
     # Load config
     config = load_config(force_regen=args.regen_config)
+    scrape_test_mode = bool(config.get("scrape_test_mode", False))
     
     # Get output path
     output_file = args.output or config['output'].get('excel_file', 'daily_jobs.xlsx')
     
-    # Step 1: Parse resume
-    print("\nðŸ“„ Step 1: Reading resume...")
-    try:
-        resume_summary = get_resume_summary(os.path.dirname(__file__))
-        print("   âœ“ Resume loaded successfully")
-    except Exception as e:
-        print(f"   âœ— Error reading resume: {e}")
-        print("   Using default skills from config...")
-        resume_summary = "Mechanical Design Engineer with CATIA V5, Autodesk Inventor, automotive and railway experience."
+    # Step 1: Load candidate profile (prefer explicit JSON, fallback to resume)
+    candidate_path = os.path.join(os.path.dirname(__file__), "candidate_profile.json")
+    if os.path.exists(candidate_path):
+        print("\nðŸ“„ Step 1: Loading candidate_profile.json...")
+        try:
+            with open(candidate_path, "r", encoding="utf-8") as f:
+                candidate_profile = json.load(f)
+            print("   âœ“ Candidate profile loaded")
+        except Exception as e:
+            print(f"   ⚠ Failed to load candidate_profile.json: {e}")
+            candidate_profile = None
+    else:
+        candidate_profile = None
+
+    if candidate_profile is None:
+        print("\nðŸ“„ Step 1: Reading resume...")
+        try:
+            resume_summary = get_resume_summary(os.path.dirname(__file__))
+            resume_data = parse_resume(os.path.dirname(__file__))
+            candidate_profile = {
+                "summary": resume_summary,
+                "skills": resume_data.get("skills", []),
+                "years_experience": resume_data.get("years_experience", "unknown")
+            }
+            print("   âœ“ Resume loaded successfully")
+        except Exception as e:
+            print(f"   âœ— Error reading resume: {e}")
+            print("   Using default skills from config...")
+            resume_summary = "Mechanical Design Engineer with CATIA V5, Autodesk Inventor, automotive and railway experience."
+            candidate_profile = {
+                "summary": resume_summary,
+                "skills": [],
+                "years_experience": "unknown"
+            }
+
+    # Keywords to hard-skip jobs BEFORE any CSV writes (manual filtering guard).
+    # If a job description contains any of these, we skip it entirely to avoid LLM overload.
+    skip_kw = (
+        candidate_profile.get("matching_rules", {}).get("negative_title_keywords", [])
+        if isinstance(candidate_profile, dict) else []
+    )
+    skip_kw = [k.strip().lower() for k in skip_kw if isinstance(k, str) and k.strip()]
+
+    def _desc_has_skip_keyword(job: dict) -> bool:
+        desc = (job.get("description") or "").lower()
+        return any(k in desc for k in skip_kw)
+
+    def _append_rejected(job: dict) -> None:
+        # Keep a FIFO list (max 100) of rejected jobs for review.
+        reject_path = os.path.join(os.path.dirname(__file__), "rejected_jobs.csv")
+        rows = []
+        if os.path.exists(reject_path):
+            with open(reject_path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        rows.append({
+            "url": job.get("url", ""),
+            "title": job.get("title", ""),
+            "company": job.get("company", ""),
+            "location": job.get("location", ""),
+            "source": job.get("source", ""),
+            "first_seen": datetime.now().isoformat(timespec="seconds"),
+            "description": job.get("description", "")
+        })
+        rows = rows[-100:]
+        with open(reject_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["url", "title", "company", "location", "source", "first_seen", "description"]
+            )
+            writer.writeheader()
+            writer.writerows(rows)
     
     print("   • Step 1 complete, moving to Step 2...", flush=True)
     try:
@@ -223,10 +291,20 @@ def main():
     nonmatch_file = config.get('output_nonmatch_file', 'daily_jobs_nonmatch.csv')
     nonmatch_path = os.path.join(os.path.dirname(__file__), nonmatch_file)
 
-    scored_urls = load_existing_urls(daily_path) | load_existing_urls(nonmatch_path)
-    pending_urls = _load_pending_urls(pending_path)
+    if not scrape_test_mode:
+        scored_urls = load_existing_urls(daily_path) | load_existing_urls(nonmatch_path)
+        pending_urls = _load_pending_urls(pending_path)
+    else:
+        scored_urls = set()
+        pending_urls = set()
 
     def _queue_job(job: dict):
+        if scrape_test_mode:
+            return
+        # Manual filter: skip jobs whose DESCRIPTION contains any negative title keyword.
+        if _desc_has_skip_keyword(job):
+            _append_rejected(job)
+            return
         url = (job.get("url") or "").strip()
         if not url:
             return
@@ -238,13 +316,17 @@ def main():
             "title": job.get("title", ""),
             "company": job.get("company", ""),
             "source": job.get("source", ""),
-            "first_seen": datetime.now().isoformat(timespec="seconds")
+            "first_seen": datetime.now().isoformat(timespec="seconds"),
+            "description": job.get("description", "")
         }
         _append_pending_row(pending_path, row)
         pending_urls.add(url_l)
 
     # Score-only path
     if args.score_only or args.score_only_manual:
+        if scrape_test_mode:
+            print("   ⚠ Scrape test mode is enabled; score-only requires CSVs. Disable scrape_test_mode.")
+            return
         # Check window unless manual
         if not args.score_only_manual:
             start = config.get("scoring_window_start", "01:00")
@@ -261,9 +343,22 @@ def main():
 
         # Prepare rater
         from rater import JobRater
-        rater = JobRater(config, resume_summary)
+        rater = JobRater(config, candidate_profile)
 
+        if not os.path.exists(pending_path):
+            print(f"   âš  Pending file not found: {pending_path}")
+            print("   âš  No job links available to score.")
+            return
         rows = _load_pending_rows(pending_path)
+        if not rows:
+            print(f"   âš  Pending file is empty: {pending_path}")
+            print("   âš  No job links available to score.")
+            return
+        rows_with_urls = [r for r in rows if (r.get("url") or "").strip()]
+        if not rows_with_urls:
+            print(f"   âš  Pending file has no valid job URLs: {pending_path}")
+            print("   âš  No job links available to score.")
+            return
         print(f"   â€¢ Pending rows: {len(rows)}")
         skipped_scored = 0
         attempted = 0
@@ -286,11 +381,15 @@ def main():
             job = {
                 "title": row.get("title", ""),
                 "company": row.get("company", ""),
-                "location": "",
+                "location": row.get("location", ""),
                 "source": row.get("source", ""),
                 "url": url,
-                "description": ""
+                "description": row.get("description", "")
             }
+            if _desc_has_skip_keyword(job):
+                _append_rejected(job)
+                _remove_pending_url(pending_path, url)
+                continue
             attempted += 1
             rated = rater.rate_jobs([job], batch_size=1)
             job = rated[0]
@@ -317,16 +416,29 @@ def main():
 
     # Scrape-only path
     if args.scrape_only:
-        print("   • Scrape-only mode: queueing jobs to score_pending_jobs.csv")
-        config["scrape_queue_only"] = True
-        jobs = scraper.scrape_all(on_job=_queue_job)
-        print(f"\nâœ“ Scrape-only complete. Queued: {len(pending_urls)} jobs.")
+        if scrape_test_mode:
+            print("   • Scrape-only test mode: scraping without CSV output")
+            jobs = scraper.scrape_all(on_job=None)
+            print(f"\nâœ“ Scrape-only test complete. Jobs scraped: {len(jobs)}")
+        else:
+            print("   • Scrape-only mode: queueing jobs to score_pending_jobs.csv")
+            config["scrape_queue_only"] = True
+            jobs = scraper.scrape_all(on_job=_queue_job)
+            print(f"\nâœ“ Scrape-only complete. Queued: {len(pending_urls)} jobs.")
         return
 
     # Default: scrape + queue + score
-    jobs = scraper.scrape_all(on_job=_queue_job)
+    jobs = scraper.scrape_all(on_job=None if scrape_test_mode else _queue_job)
+    if skip_kw:
+        filtered = []
+        for j in jobs:
+            if _desc_has_skip_keyword(j):
+                _append_rejected(j)
+            else:
+                filtered.append(j)
+        jobs = filtered
 
-    if config.get("scrape_test_mode", False):
+    if scrape_test_mode:
         print("\nðŸ§ª Scrape test mode enabled: skipping rating and export.")
         print(f"   Total jobs scraped: {len(jobs)}")
         return
@@ -348,7 +460,7 @@ def main():
             print("\nðŸ¤– Step 3: Rating jobs with AI...")
             try:
                 from rater import JobRater
-                rater = JobRater(config, resume_summary)
+                rater = JobRater(config, candidate_profile)
                 output_file = args.output or config['output'].get('excel_file', 'daily_jobs.csv')
                 nonmatch_file = config.get('output_nonmatch_file', 'daily_jobs_nonmatch.csv')
                 cache_file = config.get('cache_file', 'seen_jobs_cache.json')
