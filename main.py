@@ -362,16 +362,16 @@ def main():
         print(f"   â€¢ Pending rows: {len(rows)}")
         skipped_scored = 0
         attempted = 0
+        jobs_to_rate = []
+        job_url_map = {}
         for row in rows:
             if not args.score_only_manual and scored_today >= max_per_day:
                 print(f"   â¸ Reached daily limit ({max_per_day}).")
                 break
-
             url = (row.get("url") or "").strip()
             if not url:
                 continue
             url_l = url.lower()
-            # Refresh scored URLs in case other runs updated the CSVs
             scored_urls = load_existing_urls(daily_path) | load_existing_urls(nonmatch_path)
             if url_l in scored_urls:
                 _remove_pending_url(pending_path, url)
@@ -390,24 +390,31 @@ def main():
                 _append_rejected(job)
                 _remove_pending_url(pending_path, url)
                 continue
+            jobs_to_rate.append(job)
+            job_url_map[url_l] = job
             attempted += 1
-            rated = rater.rate_jobs([job], batch_size=1)
-            job = rated[0]
 
-            if _score_success(job):
-                if job.get("score", 0) >= config.get("min_score", 5):
-                    append_new_to_csv([job], daily_path)
+        if jobs_to_rate:
+            rated_jobs = rater.rate_jobs(jobs_to_rate, batch_size=15)
+            for job in rated_jobs:
+                url = (job.get("url") or "").strip()
+                url_l = url.lower()
+                if not url:
+                    continue
+                if _score_success(job):
+                    if job.get("score", 0) >= config.get("min_score", 5):
+                        append_new_to_csv([job], daily_path)
+                    else:
+                        append_new_to_csv([job], nonmatch_path)
+                    scored_urls.add(url_l)
+                    _remove_pending_url(pending_path, url)
+                    if not args.score_only_manual:
+                        scored_today += 1
+                        _save_daily_count(daily_log_path, scored_today)
+                        time.sleep(cooldown)
                 else:
-                    append_new_to_csv([job], nonmatch_path)
-                scored_urls.add(url_l)
-                _remove_pending_url(pending_path, url)
-                if not args.score_only_manual:
-                    scored_today += 1
-                    _save_daily_count(daily_log_path, scored_today)
-                    time.sleep(cooldown)
-            else:
-                print(f"   âš  Scoring failed for: {url}")
-                # keep in pending
+                    print(f"   âš  Scoring failed for: {url}")
+                    # keep in pending
 
         print(f"   â€¢ Skipped (already scored): {skipped_scored}")
         print(f"   â€¢ Attempted scoring: {attempted}")

@@ -64,6 +64,7 @@
         ],
         "negative_title_keywords": [
             "lead",
+            "leiter",
             "intern",
             "masterarbeit",
             "werkstudent",
@@ -71,6 +72,9 @@
             "owner",
             "wissenschaftliche mitarbeiter",
             "director",
+            "executive",
+            "spezialist",
+            "specialist",
             "praktikant",
             "student",
             "master thesis",
@@ -89,7 +93,22 @@
             "fullstack",
             "analyst",
             "ausbildung",
-            "ux"
+            "ux",
+            "data scientist",
+            "cloud",
+            ".NET",
+            "cybersecurity",
+            "cyber security",
+            "GPU",
+            "ausbild",
+            "business",
+            "azubi",
+            "dual",
+            "kfz.-mechatroniker",
+            "kfz-",
+            "verkäufer",
+            "serviceberater",
+            "berater"
         ]
     },
     "scoring_protocol": {

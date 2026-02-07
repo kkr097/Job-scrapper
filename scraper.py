@@ -158,8 +158,10 @@ class JobScraper:
         if self.sources.get('linkedin', True):
             print("\nðŸ“Œ Scraping LinkedIn...")
             linkedin_url = self.config.get("linkedin_search_url", "").strip()
-            linkedin_urls = self.config.get("linkedin_search_urls", []) or []
-            linkedin_urls = [u for u in linkedin_urls if isinstance(u, str) and u.strip()]
+            linkedin_urls = []
+            if self.config.get("linkedin_search_urls_enabled", True):
+                linkedin_urls = self.config.get("linkedin_search_urls", []) or []
+                linkedin_urls = [u for u in linkedin_urls if isinstance(u, str) and u.strip()]
             if linkedin_url:
                 linkedin_urls = [linkedin_url] + linkedin_urls
             use_playwright = bool(self.config.get("linkedin_use_playwright", False))

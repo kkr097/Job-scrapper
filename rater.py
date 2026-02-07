@@ -51,7 +51,7 @@ class JobRater:
             "gemini_cooldown_until": 0
         }
 
-    def rate_jobs(self, jobs: List[Dict], batch_size: int = 5) -> List[Dict]:
+    def rate_jobs(self, jobs: List[Dict], batch_size: int = 15) -> List[Dict]:
         """Rate all jobs against the resume."""
         if not self.api_type:
             print("   No API available - assigning default scores")
@@ -68,15 +68,13 @@ class JobRater:
             print(f"   Rating jobs {i+1}-{min(i+batch_size, len(jobs))}...")
             
             try:
-                rated_batch = []
-                for job in batch:
-                    rated_batch.append(self._rate_one(job))
+                rated_batch = self._rate_batch(batch)
                 rated.extend(rated_batch)
                 
                 # Rate limit delay
                 if i + batch_size < len(jobs):
                     if self.api_type in ['gemini', 'groq', 'multi']:
-                        wait_seconds = int(self.config.get('groq_wait_seconds', 30))
+                        wait_seconds = int(self.config.get('llm_batch_sleep_seconds', 12))
                         print(f"   Waiting {wait_seconds}s to avoid rate limits...")
                         time.sleep(wait_seconds)
                     else:
@@ -92,20 +90,25 @@ class JobRater:
         
         return rated
     
-    def _rate_one(self, job: Dict) -> Dict:
-        """Rate a single job with AI."""
-        desc = (job.get("description") or "").strip()
-        if len(desc) > 2000:
-            desc = desc[:2000] + "..."
-        job_text = "\n".join([
-            f"Title: {job.get('title','')}",
-            f"Company: {job.get('company','')}",
-            f"Location: {job.get('location','')}",
-            f"URL: {job.get('url','')}",
-            f"Description: {desc}"
-        ])
-
+    def _rate_batch(self, jobs: List[Dict]) -> List[Dict]:
+        """Rate a batch of jobs with AI."""
         candidate_json = json.dumps(self.candidate_profile, ensure_ascii=False)
+
+        job_blocks = []
+        for idx, job in enumerate(jobs, 1):
+            desc = (job.get("description") or "").strip()
+            if len(desc) > 2000:
+                desc = desc[:2000] + "..."
+            block = "\n".join([
+                f"JOB {idx}",
+                f"Title: {job.get('title','')}",
+                f"Company: {job.get('company','')}",
+                f"Location: {job.get('location','')}",
+                f"URL: {job.get('url','')}",
+                f"Description: {desc}"
+            ])
+            job_blocks.append(block)
+        jobs_text = "\n\n".join(job_blocks)
 
         prompt = f"""### ROLE
 Expert Technical Talent Matcher (Automotive & Embedded Systems).
@@ -123,7 +126,7 @@ Perform a "Step-by-Step Gap Analysis" before assigning the final score to ensure
 ---
 
 ### JOB_DESCRIPTION (Extracted Text)
-{job_text}
+{jobs_text}
 
 ---
 
@@ -155,24 +158,23 @@ Perform a "Step-by-Step Gap Analysis" before assigning the final score to ensure
 
 ### OUTPUT FORMAT (Strict JSON)
 {{
-  "analysis": {{
-    "extracted_requirements": ["list 5 key skills found in job"],
-    "matching_skills": ["list candidate's overlapping skills"],
-    "missing_skills": ["list key job requirements candidate lacks"],
-    "red_flags": ["list any negative keywords or title mismatches found"]
-  }},
-  "scoring_breakdown": {{
-    "tech_score": "1-10",
-    "domain_score": "1-10",
-    "fit_score": "1-10",
-    "final_weighted_score": 0
-  }},
-  "verdict": "Short explanation of why the candidate is or isn't a match."
+  "ratings": [
+    {{
+      "job_id": "unique_id_or_number",
+      "score": 0,
+      "analysis": {{
+        "matching_points": ["list specific positive matches"],
+        "red_flags": ["list negative keywords or title penalties found"],
+        "missing_skills": ["list key requirements from job not in resume"]
+      }},
+      "verdict": "One sentence summary of fit."
+    }}
+  ]
 }}
 
 ### INPUT DATA
 JOBS TO EVALUATE:
-{job_text}"""
+{jobs_text}"""
 
         # Call the appropriate API
         if self.api_type == 'deepseek':
@@ -183,10 +185,11 @@ JOBS TO EVALUATE:
             result = None
 
         if not result:
-            job['score'] = 5
-            job['match_reasons'] = 'API call failed'
-            job['missing_skills'] = ''
-            return job
+            for job in jobs:
+                job['score'] = 5
+                job['match_reasons'] = 'API call failed'
+                job['missing_skills'] = ''
+            return jobs
 
         # Parse JSON response
         try:
@@ -201,28 +204,35 @@ JOBS TO EVALUATE:
                 json_str = result[start:end].strip()
 
             payload = json.loads(json_str)
-            breakdown = payload.get("scoring_breakdown", {})
-            score = breakdown.get("final_weighted_score", 5)
-            try:
-                score = float(score)
-            except Exception:
-                score = 5
-
-            job['score'] = score
-            job['match_reasons'] = payload.get("verdict", "")
-            missing = payload.get("analysis", {}).get("missing_skills", [])
-            if isinstance(missing, list):
-                job['missing_skills'] = ", ".join(missing)
-            else:
-                job['missing_skills'] = str(missing or "")
-            return job
+            ratings = payload.get("ratings", [])
+            for idx, job in enumerate(jobs):
+                if idx < len(ratings):
+                    rating = ratings[idx]
+                    score = rating.get("score", 5)
+                    try:
+                        score = float(score)
+                    except Exception:
+                        score = 5
+                    job['score'] = score
+                    job['match_reasons'] = rating.get("verdict", "")
+                    missing = rating.get("analysis", {}).get("missing_skills", [])
+                    if isinstance(missing, list):
+                        job['missing_skills'] = ", ".join(missing)
+                    else:
+                        job['missing_skills'] = str(missing or "")
+                else:
+                    job['score'] = 5
+                    job['match_reasons'] = ''
+                    job['missing_skills'] = ''
+            return jobs
 
         except Exception as e:
             print(f"   JSON parse error: {e}")
-            job['score'] = 5
-            job['match_reasons'] = 'Parse error'
-            job['missing_skills'] = ''
-            return job
+            for job in jobs:
+                job['score'] = 5
+                job['match_reasons'] = 'Parse error'
+                job['missing_skills'] = ''
+            return jobs
     
     def _call_deepseek(self, prompt: str) -> str:
         """Call DeepSeek API."""
@@ -284,7 +294,7 @@ JOBS TO EVALUATE:
             api_key = self.config.get('gemini_api_key', '')
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-1.5-flash",
                 contents=prompt
             )
             return response.text
