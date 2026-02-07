@@ -23,5 +23,6 @@ Thumbs.db
 
 */*.csv
 .env
-*/*.log
-*/*.ps1
+/**/*.log
+/**/*.ps1
+/**/*.csv
