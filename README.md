@@ -62,7 +62,7 @@ flowchart TD
     I -->|--scrape-only| J[score_pending_jobs.csv]
     I -->|--score-only| K[Batch LLM scoring]
     I -->|default| K
-    K --> L[Export daily_jobs.csv + daily_jobs_nonmatch.csv (+ .xlsx if configured)]
+    K --> L[Export CSV and optional XLSX]
 ```
 
 ## Output
