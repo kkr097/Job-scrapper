@@ -51,7 +51,7 @@ class JobRater:
             "gemini_cooldown_until": 0
         }
 
-    def rate_jobs(self, jobs: List[Dict], batch_size: int = 15) -> List[Dict]:
+    def rate_jobs(self, jobs: List[Dict], batch_size: int = 5) -> List[Dict]:
         """Rate all jobs against the resume."""
         if not self.api_type:
             print("   No API available - assigning default scores")
@@ -294,7 +294,7 @@ JOBS TO EVALUATE:
             api_key = self.config.get('gemini_api_key', '')
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
-                model="gemini-1.5-flash",
+                model="gemini-2.5-flash",
                 contents=prompt
             )
             return response.text

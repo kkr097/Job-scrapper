@@ -395,7 +395,7 @@ def main():
             attempted += 1
 
         if jobs_to_rate:
-            rated_jobs = rater.rate_jobs(jobs_to_rate, batch_size=15)
+            rated_jobs = rater.rate_jobs(jobs_to_rate, batch_size=5)
             for job in rated_jobs:
                 url = (job.get("url") or "").strip()
                 url_l = url.lower()

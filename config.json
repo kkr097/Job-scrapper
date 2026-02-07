@@ -1,9 +1,9 @@
 {
     "min_score": 5,
     "groq_wait_seconds": 100,
-    "llm_batch_sleep_seconds": 12,
+    "llm_batch_sleep_seconds": 60,
     "rating_preferred": "gemini",
-    "scrape_test_mode": true,
+    "scrape_test_mode": false,
     "sources": {
         "linkedin": true,
         "xing": false,
