@@ -239,9 +239,11 @@ def main():
     )
     skip_kw = [k.strip().lower() for k in skip_kw if isinstance(k, str) and k.strip()]
 
-    def _desc_has_skip_keyword(job: dict) -> bool:
+    def _has_skip_keyword(job: dict) -> bool:
+        title = (job.get("title") or "").lower()
         desc = (job.get("description") or "").lower()
-        return any(k in desc for k in skip_kw)
+        text = f"{title} {desc}"
+        return any(k in text for k in skip_kw)
 
     def _append_rejected(job: dict) -> None:
         # Keep a FIFO list (max 100) of rejected jobs for review.
@@ -301,8 +303,8 @@ def main():
     def _queue_job(job: dict):
         if scrape_test_mode:
             return
-        # Manual filter: skip jobs whose DESCRIPTION contains any negative title keyword.
-        if _desc_has_skip_keyword(job):
+        # Manual filter: skip jobs whose TITLE or DESCRIPTION contains any negative title keyword.
+        if _has_skip_keyword(job):
             _append_rejected(job)
             return
         url = (job.get("url") or "").strip()
@@ -386,7 +388,7 @@ def main():
                 "url": url,
                 "description": row.get("description", "")
             }
-            if _desc_has_skip_keyword(job):
+            if _has_skip_keyword(job):
                 _append_rejected(job)
                 _remove_pending_url(pending_path, url)
                 continue
@@ -439,7 +441,7 @@ def main():
     if skip_kw:
         filtered = []
         for j in jobs:
-            if _desc_has_skip_keyword(j):
+            if _has_skip_keyword(j):
                 _append_rejected(j)
             else:
                 filtered.append(j)
