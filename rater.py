@@ -71,14 +71,7 @@ class JobRater:
                 rated_batch = self._rate_batch(batch)
                 rated.extend(rated_batch)
                 
-                # Rate limit delay
-                if i + batch_size < len(jobs):
-                    if self.api_type in ['gemini', 'groq', 'multi']:
-                        wait_seconds = int(self.config.get('llm_batch_sleep_seconds', 12))
-                        print(f"   Waiting {wait_seconds}s to avoid rate limits...")
-                        time.sleep(wait_seconds)
-                    else:
-                        time.sleep(1.5)
+                  # Rate limiting is handled by the caller to allow async CSV updates.
                     
             except Exception as e:
                 print(f"   ⚠ Rating error: {e}")
@@ -210,9 +203,10 @@ JOBS TO EVALUATE:
                     rating = ratings[idx]
                     score = rating.get("score", 5)
                     try:
-                        score = float(score)
+                        score = int(round(float(score)))
                     except Exception:
                         score = 5
+                    score = max(1, min(10, score))
                     job['score'] = score
                     job['match_reasons'] = rating.get("verdict", "")
                     missing = rating.get("analysis", {}).get("missing_skills", [])

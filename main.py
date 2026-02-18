@@ -397,27 +397,40 @@ def main():
             attempted += 1
 
         if jobs_to_rate:
-            rated_jobs = rater.rate_jobs(jobs_to_rate, batch_size=5)
-            for job in rated_jobs:
-                url = (job.get("url") or "").strip()
-                url_l = url.lower()
-                if not url:
-                    continue
-                if _score_success(job):
-                    if job.get("score", 0) >= config.get("min_score", 5):
-                        append_new_to_csv([job], daily_path)
+            batch_size = 5
+            failed_llm = 0
+            for i in range(0, len(jobs_to_rate), batch_size):
+                batch = jobs_to_rate[i:i + batch_size]
+                rated_jobs = rater.rate_jobs(batch, batch_size=len(batch))
+                for job in rated_jobs:
+                    url = (job.get("url") or "").strip()
+                    url_l = url.lower()
+                    if not url:
+                        continue
+                    if _score_success(job):
+                        if job.get("score", 0) >= config.get("min_score", 5):
+                            append_new_to_csv([job], daily_path)
+                        else:
+                            append_new_to_csv([job], nonmatch_path)
+                        scored_urls.add(url_l)
+                        _remove_pending_url(pending_path, url)
+                        if not args.score_only_manual:
+                            scored_today += 1
+                            _save_daily_count(daily_log_path, scored_today)
+                            time.sleep(cooldown)
                     else:
-                        append_new_to_csv([job], nonmatch_path)
-                    scored_urls.add(url_l)
-                    _remove_pending_url(pending_path, url)
-                    if not args.score_only_manual:
-                        scored_today += 1
-                        _save_daily_count(daily_log_path, scored_today)
-                        time.sleep(cooldown)
-                else:
-                    print(f"   âš  Scoring failed for: {url}")
-                    # keep in pending
+                        failed_llm += 1
+                        print(f"   ⚠ Scoring failed for: {url}")
+                        # keep in pending
 
+                # Sleep between LLM batches to respect rate limits
+                if i + batch_size < len(jobs_to_rate):
+                    wait_seconds = int(config.get("llm_batch_sleep_seconds", 60))
+                    print(f"   Waiting {wait_seconds}s to avoid rate limits...")
+                    time.sleep(wait_seconds)
+            print(f"   • Failed due to LLM limits/errors: {failed_llm}")
+        else:
+            failed_llm = 0
         print(f"   â€¢ Skipped (already scored): {skipped_scored}")
         print(f"   â€¢ Attempted scoring: {attempted}")
         print("   âœ“ Score-only run complete.")
