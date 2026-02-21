@@ -397,7 +397,8 @@ def main():
             attempted += 1
 
         if jobs_to_rate:
-            batch_size = 5
+            # Prefer larger batches when Gemini is available; smaller for Groq-only.
+            batch_size = 15 if getattr(rater, "has_gemini", False) else 5
             failed_llm = 0
             for i in range(0, len(jobs_to_rate), batch_size):
                 batch = jobs_to_rate[i:i + batch_size]
