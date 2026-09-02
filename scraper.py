@@ -298,12 +298,15 @@ class JobScraper:
                 "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
                 f"?keywords={keyword_enc}&location={location_enc}&f_TPR=r172800"
             )
-        max_pages = int(self.config.get("linkedin_max_pages", 20))
-        page_size = int(self.config.get("linkedin_page_size", 25))
+        # LinkedIn's public guest endpoint delivers 25 cards per response.
+        # Requesting larger pages does not increase that limit, and using a
+        # smaller offset makes pages overlap (0, 10, 20, ...), which wastes
+        # requests and tends to trigger LinkedIn's 429 rate limit.
+        max_pages = max(1, int(self.config.get("linkedin_max_pages", 40)))
+        page_size = 25
         fetch_all = bool(self.config.get("linkedin_fetch_all", False))
-        scroll_step = int(self.config.get("linkedin_scroll_step", page_size))
-        if scroll_step <= 0:
-            scroll_step = page_size
+        request_retries = max(0, int(self.config.get("linkedin_request_retries", 3)))
+        retry_seconds = max(1, float(self.config.get("linkedin_retry_seconds", 45)))
 
         def _extract_total_jobs(soup: BeautifulSoup) -> Optional[int]:
             # Try specific counters first
@@ -320,33 +323,60 @@ class JobScraper:
             return None
         
         try:
-            if fetch_all and max_pages < 10:
-                max_pages = 10
             seen_urls = set()
             empty_pages = 0
-            total_items = max_pages * page_size
-            start_values = list(range(0, total_items, scroll_step))
-            for start in start_values:
+            page_index = 0
+            pages_to_fetch = max_pages
+            while page_index < pages_to_fetch:
+                start = page_index * page_size
                 parsed = urlparse(url)
                 qs = parse_qs(parsed.query)
                 qs["start"] = [str(start)]
                 qs["count"] = [str(page_size)]
                 page_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
-                response = requests.get(page_url, headers=self._get_headers("linkedin"), timeout=15, cookies={})
-                if response.status_code != 200:
-                    self._log_failed_request("linkedin", page_url, f"status={response.status_code}")
-                response.raise_for_status()
+                response = None
+                for attempt in range(request_retries + 1):
+                    try:
+                        response = requests.get(
+                            page_url,
+                            headers=self._get_headers("linkedin"),
+                            timeout=20,
+                            cookies={},
+                        )
+                        if response.status_code == 200:
+                            break
+                        if response.status_code not in {429, 500, 502, 503, 504}:
+                            response.raise_for_status()
+                    except requests.RequestException as error:
+                        if attempt == request_retries:
+                            raise error
+                    if attempt == request_retries:
+                        assert response is not None
+                        self._log_failed_request("linkedin", page_url, f"status={response.status_code}")
+                        response.raise_for_status()
+                    retry_after = response.headers.get("Retry-After") if response is not None else None
+                    try:
+                        wait_seconds = max(retry_seconds, float(retry_after)) if retry_after else retry_seconds
+                    except (TypeError, ValueError):
+                        wait_seconds = retry_seconds
+                    print(f"   ⚠ LinkedIn returned a temporary error; retrying in {int(wait_seconds)}s...")
+                    time.sleep(wait_seconds)
+                if response is None or response.status_code != 200:
+                    break
                 soup = BeautifulSoup(response.text, 'lxml')
-                if start == 0 and (fetch_all or max_pages <= 0):
+                if start == 0 and fetch_all:
                     total = _extract_total_jobs(soup)
                     if total:
-                        max_pages = max(1, math.ceil(total / page_size))
-                        total_items = max_pages * page_size
-                        start_values = list(range(0, total_items, scroll_step))
+                        pages_to_fetch = min(max_pages, max(1, math.ceil(total / page_size)))
 
                 cards = soup.find_all(class_=re.compile(r'base-card|job-search-card|result-card|job-result-card'))
                 if not cards:
-                    break
+                    empty_pages += 1
+                    if empty_pages >= 2:
+                        break
+                    page_index += 1
+                    self._linkedin_delay()
+                    continue
 
                 new_found = 0
                 for card in cards:
@@ -361,14 +391,10 @@ class JobScraper:
                         self._emit_job(job)
                         new_found += 1
                     self._linkedin_card_delay()
-                if new_found == 0:
-                    empty_pages += 1
-                    if empty_pages >= 3:
-                        break
-                else:
-                    empty_pages = 0
+                empty_pages = 0
                 # Slow down between pages to mimic human scrolling pace
                 self._linkedin_delay()
+                page_index += 1
                     
         except Exception as e:
             print(f"   âš  LinkedIn error: {e}")
