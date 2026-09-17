@@ -14,6 +14,7 @@ import json
 import csv
 import argparse
 import time
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -88,7 +89,7 @@ def _load_pending_rows(path: str) -> list:
     if not os.path.exists(path):
         print(f"   ⚠ CSV not found: {path}")
         return []
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     if not rows:
         print(f"   ⚠ CSV empty: {path}")
@@ -233,17 +234,22 @@ def main():
 
     # Keywords to hard-skip jobs BEFORE any CSV writes (manual filtering guard).
     # If a job description contains any of these, we skip it entirely to avoid LLM overload.
-    skip_kw = (
-        candidate_profile.get("matching_rules", {}).get("negative_title_keywords", [])
-        if isinstance(candidate_profile, dict) else []
-    )
-    skip_kw = [k.strip().lower() for k in skip_kw if isinstance(k, str) and k.strip()]
+    matching_rules = candidate_profile.get("matching_rules", {}) if isinstance(candidate_profile, dict) else {}
+    negative_title_kw = matching_rules.get("negative_title_keywords", [])
+    negative_description_kw = matching_rules.get("negative_description_keywords", [])
+    negative_title_kw = [k.strip().lower() for k in negative_title_kw if isinstance(k, str) and k.strip()]
+    negative_description_kw = [k.strip().lower() for k in negative_description_kw if isinstance(k, str) and k.strip()]
+
+    def _contains_keyword(text: str, keyword: str) -> bool:
+        """Match terms without treating short words as arbitrary substrings."""
+        return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text, re.IGNORECASE) is not None
 
     def _has_skip_keyword(job: dict) -> bool:
         title = (job.get("title") or "").lower()
         desc = (job.get("description") or "").lower()
-        text = f"{title} {desc}"
-        return any(k in text for k in skip_kw)
+        return any(_contains_keyword(title, k) for k in negative_title_kw) or any(
+            _contains_keyword(desc, k) for k in negative_description_kw
+        )
 
     def _append_rejected(job: dict) -> None:
         # Keep a FIFO list (max 100) of rejected jobs for review.
@@ -346,6 +352,9 @@ def main():
         # Prepare rater
         from rater import JobRater
         rater = JobRater(config, candidate_profile)
+        use_local_scoring = getattr(rater, "api_type", None) == "lmstudio"
+        if use_local_scoring:
+            print("   Local LM Studio scoring: no daily cap or rate-limit waits.")
 
         if not os.path.exists(pending_path):
             print(f"   âš  Pending file not found: {pending_path}")
@@ -367,7 +376,11 @@ def main():
         jobs_to_rate = []
         job_url_map = {}
         for row in rows:
-            if not args.score_only_manual and scored_today >= max_per_day:
+            if (
+                not use_local_scoring
+                and not args.score_only_manual
+                and scored_today >= max_per_day
+            ):
                 print(f"   â¸ Reached daily limit ({max_per_day}).")
                 break
             url = (row.get("url") or "").strip()
@@ -397,8 +410,12 @@ def main():
             attempted += 1
 
         if jobs_to_rate:
-            # Prefer larger batches when Gemini is available; smaller for Groq-only.
-            batch_size = 15 if getattr(rater, "has_gemini", False) else 5
+            # Local models have limited context; keep their scoring prompts to one job.
+            if getattr(rater, "api_type", None) == "lmstudio":
+                batch_size = int(config.get("lmstudio_batch_size", 1))
+            else:
+                # Prefer larger batches when Gemini is available; smaller for Groq-only.
+                batch_size = 15 if getattr(rater, "has_gemini", False) else 5
             failed_llm = 0
             for i in range(0, len(jobs_to_rate), batch_size):
                 batch = jobs_to_rate[i:i + batch_size]
@@ -415,17 +432,18 @@ def main():
                             append_new_to_csv([job], nonmatch_path)
                         scored_urls.add(url_l)
                         _remove_pending_url(pending_path, url)
-                        if not args.score_only_manual:
+                        if not use_local_scoring and not args.score_only_manual:
                             scored_today += 1
                             _save_daily_count(daily_log_path, scored_today)
                             time.sleep(cooldown)
                     else:
                         failed_llm += 1
-                        print(f"   ⚠ Scoring failed for: {url}")
+                        reason = job.get("match_reasons") or "unknown scoring error"
+                        print(f"   ⚠ Scoring failed for: {url} ({reason})")
                         # keep in pending
 
-                # Sleep between LLM batches to respect rate limits
-                if i + batch_size < len(jobs_to_rate):
+                # Cloud APIs need breathing room; the local server does not.
+                if not use_local_scoring and i + batch_size < len(jobs_to_rate):
                     wait_seconds = int(config.get("llm_batch_sleep_seconds", 60))
                     print(f"   Waiting {wait_seconds}s to avoid rate limits...")
                     time.sleep(wait_seconds)
@@ -452,7 +470,7 @@ def main():
 
     # Default: scrape + queue + score
     jobs = scraper.scrape_all(on_job=None if scrape_test_mode else _queue_job)
-    if skip_kw:
+    if negative_title_kw or negative_description_kw:
         filtered = []
         for j in jobs:
             if _has_skip_keyword(j):
@@ -472,11 +490,12 @@ def main():
     
     # Step 3: Rate jobs with AI
     if not args.no_rate:
-        # Check if any API key is configured
+        # LM Studio is local and intentionally requires no API key.
         has_api = any([
             config.get('deepseek_api_key', '').startswith('sk-'),
             config.get('groq_api_key', '').startswith('gsk_'),
-            config.get('gemini_api_key', '').startswith('AIza')
+            config.get('gemini_api_key', '').startswith('AIza'),
+            bool(config.get('lmstudio_enabled', False)),
         ])
         
         if has_api:
@@ -531,7 +550,7 @@ def main():
                         job['missing_skills'] = ''
         else:
             print("\nâš  Step 3: No API key configured")
-            print("   Add an API key to config.json (DeepSeek, Groq, or Gemini)")
+            print("   Configure LM Studio or add an API key (DeepSeek, Groq, or Gemini)")
             print("   Assigning default scores for now...")
             for job in jobs:
                 if 'score' not in job:

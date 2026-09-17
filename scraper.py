@@ -646,14 +646,24 @@ class JobScraper:
                     loc_elem = card.find(['span', 'div'], class_=re.compile(r'location|city', re.IGNORECASE)) if card else None
                     location = loc_elem.get_text(strip=True) if loc_elem else ""
 
+                    description = ""
+                    description_elem = card.find(
+                        ['p', 'div', 'span'],
+                        class_=re.compile(r'description|snippet|summary|teaser', re.IGNORECASE)
+                    )
+                    if description_elem:
+                        description = description_elem.get_text(" ", strip=True)
+
                     job = {
                         'title': title,
                         'company': company,
                         'location': location,
                         'url': url,
+                        'description': description,
                         'source': 'XING',
                         'date_found': datetime.now().isoformat()
                     }
+                    self._enrich_xing_description(job)
                     if not self._should_exclude(job):
                         jobs.append(job)
                         self._emit_job(job)
@@ -684,9 +694,11 @@ class JobScraper:
                         'company': company,
                         'location': location,
                         'url': url,
+                        'description': "",
                         'source': 'XING',
                         'date_found': datetime.now().isoformat()
                     }
+                    self._enrich_xing_description(job)
                     if not self._should_exclude(job):
                         jobs.append(job)
                         self._emit_job(job)
@@ -695,6 +707,53 @@ class JobScraper:
             print(f"   âš  XING error: {e}")
             self._log_failed_request("xing", base_url, f"error={e}")
         return jobs
+
+    def _enrich_xing_description(self, job: Dict) -> None:
+        """Fetch the public XING job page and extract its full description."""
+        if not self.config.get("xing_fetch_full_descriptions", True):
+            return
+        url = (job.get("url") or "").strip()
+        if not url or not url.startswith("http"):
+            return
+        try:
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                timeout=float(self.config.get("xing_description_timeout_seconds", 20)),
+            )
+            if response.status_code != 200:
+                return
+            soup = BeautifulSoup(response.text, "lxml")
+            description = ""
+            for selector in [
+                '[class*="description"]',
+                '[class*="job-detail"]',
+                '[class*="jobDescription"]',
+                'main article',
+                'main',
+            ]:
+                element = soup.select_one(selector)
+                if element:
+                    candidate = element.get_text(" ", strip=True)
+                    if len(candidate) > len(description):
+                        description = candidate
+            for script in soup.select('script[type="application/ld+json"]'):
+                try:
+                    payload = json.loads(script.string or script.get_text())
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                payloads = payload if isinstance(payload, list) else [payload]
+                for item in payloads:
+                    if isinstance(item, dict):
+                        candidate = BeautifulSoup(
+                            str(item.get("description") or ""), "lxml"
+                        ).get_text(" ", strip=True)
+                        if len(candidate) > len(description):
+                            description = candidate
+            if description:
+                job["description"] = description
+        except requests.RequestException:
+            return
 
     def _scrape_xing_playwright(self, base_url: str) -> List[Dict]:
         """Scrape XING job search using Playwright to click 'Show more'."""
@@ -779,14 +838,24 @@ class JobScraper:
                     loc_elem = card.find(['span', 'div'], class_=re.compile(r'location|city', re.IGNORECASE)) if card else None
                     location = loc_elem.get_text(strip=True) if loc_elem else ""
 
+                    description = ""
+                    description_elem = card.find(
+                        ['p', 'div', 'span'],
+                        class_=re.compile(r'description|snippet|summary|teaser', re.IGNORECASE)
+                    )
+                    if description_elem:
+                        description = description_elem.get_text(" ", strip=True)
+
                     job = {
                         'title': title,
                         'company': company,
                         'location': location,
                         'url': url,
+                        'description': description,
                         'source': 'XING',
                         'date_found': datetime.now().isoformat()
                     }
+                    self._enrich_xing_description(job)
                     if not self._should_exclude(job):
                         jobs.append(job)
                         self._emit_job(job)
