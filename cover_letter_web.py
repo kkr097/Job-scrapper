@@ -14,6 +14,7 @@ import secrets
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http import cookies
+from pathlib import Path
 from typing import Any, Callable
 from wsgiref.simple_server import make_server
 
@@ -22,6 +23,8 @@ from cover_letters import CoverLetterStore, DEFAULT_DB
 
 SESSION_COOKIE = "kk_cover_admin"
 MAX_JSON_BYTES = 5_000_000
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+DONATION_QR_PATH = STATIC_DIR / "donation-qr.jpeg"
 
 
 def hash_password(password: str, iterations: int = 390_000) -> str:
@@ -126,6 +129,18 @@ class CoverLetterWebApp:
         return [encoded]
 
     @staticmethod
+    def _asset_response(start_response: Callable, body: bytes, content_type: str, status: str = "200 OK"):
+        start_response(status, [
+            ("Content-Type", content_type), ("Content-Length", str(len(body))),
+            ("Cache-Control", "public, max-age=3600"),
+            ("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"),
+            ("X-Robots-Tag", "noindex, nofollow"),
+            ("Referrer-Policy", "strict-origin-when-cross-origin"),
+            ("Content-Security-Policy", "default-src 'none'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'"),
+        ])
+        return [body]
+
+    @staticmethod
     def _json_response(start_response: Callable, payload: Any, status: str = "200 OK"):
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         start_response(status, [
@@ -142,14 +157,13 @@ class CoverLetterWebApp:
 
     @staticmethod
     def _layout(title: str, content: str, admin: bool = False) -> str:
-        nav = '<a href="/">Jobs</a>' + ('<a href="/admin">Private dashboard</a>' if admin else '<a href="/admin">Admin</a>')
+        nav = '<a href="/">Jobs</a><a href="/faq">FAQ</a>' + ('<a href="/admin">Private dashboard</a>' if admin else '<a href="/admin">Admin</a>')
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>
 <style>
 :root{{--ink:#0a0a0a;--paper:#fff;--line:#d9d9d9;--muted:#696969}}*{{box-sizing:border-box}}
 body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 Arial,sans-serif}}header{{display:flex;justify-content:space-between;align-items:center;padding:22px 5vw;border-bottom:1px solid var(--line)}}
-header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px}}a{{color:inherit}}main{{max-width:1180px;margin:auto;padding:44px 5vw}}h1{{font-size:clamp(2.3rem,6vw,5.6rem);line-height:.98;max-width:900px;margin:0 0 38px}}h2{{margin-top:34px}}.meta{{color:var(--muted);font-size:.88rem}}.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:0 0 30px}}.stat{{border:1px solid var(--line);padding:22px}}.stat b{{display:block;font-size:2.5rem}}.toolbar{{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 28px}}select,input,textarea,button{{font:inherit;padding:10px 12px;border:1px solid var(--ink);background:#fff}}button,.pill{{border-radius:999px;background:#0a0a0a;color:#fff;padding:10px 18px;text-decoration:none;display:inline-block}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:14px 10px;border-bottom:1px solid var(--line);vertical-align:top}}.expired{{color:#777}}pre{{white-space:pre-wrap;font:inherit;border:1px solid var(--line);padding:24px}}.card{{border:1px solid var(--line);padding:24px;margin:18px 0}}.error{{color:#9b1c1c}}textarea{{display:block;width:100%;min-height:70px;margin:10px 0}}@media(max-width:760px){{table,thead,tbody,tr,th,td{{display:block}}thead{{display:none}}td{{padding:5px 0;border:0}}tr{{padding:18px 0;border-bottom:1px solid var(--line)}}}}
-</style></head><body><header><strong>KK JOBS</strong><nav>{nav}</nav></header><main>{content}</main></body></html>"""
+</style></head><body><header><strong>KK JOBS</strong><nav>{nav}</nav></header><main>{content}</main><footer class="meta" style="max-width:1180px;margin:auto;padding:0 5vw 34px">Developed by KK with help from ChatGPT/Codex Cowork.</footer></body></html>"""
 
     def _public_home(self, environ: dict, start_response: Callable):
         query = dict(urllib.parse.parse_qsl(environ.get("QUERY_STRING", "")))
@@ -170,9 +184,29 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             rows.append(f'<tr class="{status_class}"><td><a href="{html.escape(job["url"], quote=True)}" rel="noopener noreferrer">{html.escape(job["title"])}</a><div class="meta">{html.escape(job["company"])}</div></td><td>{html.escape(date)}</td><td>{html.escape(job["source"])}</td><td>{html.escape(str(job["score"] or ""))}</td><td>{html.escape(job["age_status"].title())}</td><td>{letter}</td></tr>')
         content = f"""<p class="meta">CURATED JOBS · LAST 28 DAYS</p><h1>Relevant work, without the noise.</h1>
 <section class="stats"><div class="stat"><span>Jobs in last 14 days</span><b>{active_count}</b></div><div class="stat"><span>Expired jobs, days 15–28</span><b>{expired_count}</b></div></section>
+<section class="card donation"><h2>Buy me a coffee</h2><p>If this job collection saves you time, you can support the project voluntarily. Scan the PayPal QR code with your phone.</p><img src="/static/donation-qr.jpeg" alt="PayPal donation QR code for Krishnakumar Radhakrishna Panicker" loading="lazy" width="320" height="360"></section>
 <form class="toolbar" method="get"><label>Status <select name="view"><option value="all">All</option><option value="active" {'selected' if view=='active' else ''}>Last 14 days</option><option value="expired" {'selected' if view=='expired' else ''}>Days 15–28</option></select></label><label>Minimum score <input name="score" type="number" min="0" max="10" value="{html.escape(query.get('score',''))}"></label><button>Filter</button></form>
 <table><thead><tr><th>Job</th><th>Date</th><th>Source</th><th>Score</th><th>Status</th><th>Letter</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="6">No jobs match these filters.</td></tr>'}</tbody></table>"""
         return self._response(start_response, self._layout("KK Jobs", content))
+
+    def _faq(self, start_response: Callable):
+        content = """<p class="meta">ABOUT THIS PROJECT</p><h1>Frequently asked questions</h1>
+<p>This is a personal job-curation project developed by KK with help from ChatGPT/Codex Cowork. The job links and application decisions remain yours.</p>
+<section class="card"><h2>Jobs</h2>
+<details><summary>Where do these jobs come from?</summary><p>The list is collected from LinkedIn, XING, and selected employer career pages. Each job title links to the original source where you can apply.</p></details>
+<details><summary>How often is the list updated?</summary><p>Scraping and scoring run automatically Monday through Friday in the evening. The website is synchronized afterward. There are no scheduled weekend runs.</p></details>
+<details><summary>What does the matching score mean?</summary><p>It is an automated relevance aid based on the project’s configured profile. It is not a guarantee that a job is suitable or that an application will succeed.</p></details>
+<details><summary>Why are some jobs marked expired?</summary><p>Jobs remain publicly visible for up to 28 days. The “expired” view contains older jobs from that window, while older public records are removed.</p></details></section>
+<section class="card"><h2>Applications and cover letters</h2>
+<details><summary>Where do I apply?</summary><p>Use the job title link to open the original LinkedIn, XING, or employer page and apply there.</p></details>
+<details><summary>What is a cover-letter sample?</summary><p>It is a redacted example shown to visitors. Personal contact details, the signature, private notes, and application status are omitted.</p></details>
+<details><summary>Why is a cover letter sometimes unavailable?</summary><p>A grounded letter is created only when the job description contains enough evidence to match the candidate profile. Missing or inadequate descriptions are intentionally marked unavailable.</p></details>
+<details><summary>Can visitors see the complete letters or application tracking?</summary><p>No. Only KK’s authenticated private dashboard contains complete letters, application status, and private notes.</p></details></section>
+<section class="card"><h2>Privacy and support</h2>
+<details><summary>What personal information is public?</summary><p>The public site shows job information and redacted letter samples only. Private application data is protected on the server.</p></details>
+<details><summary>How can I support this project?</summary><p>Support is completely voluntary. Scan the PayPal QR code on the jobs page if the project is useful to you.</p></details>
+<details><summary>Who created this?</summary><p>KK developed the idea and the website with help from ChatGPT/Codex Cowork. Candidate facts and application decisions are based on KK’s own documents and choices.</p></details></section>"""
+        return self._response(start_response, self._layout("FAQ", content))
 
     def _public_letter(self, job_id: str, start_response: Callable):
         job = self.store.get_public_job(job_id)
@@ -246,6 +280,11 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             return self._json_response(start_response, {"status": "ok"})
         if method == "GET" and path == "/robots.txt":
             return self._response(start_response, "User-agent: *\nDisallow: /\n")
+        if method == "GET" and path == "/static/donation-qr.jpeg":
+            try:
+                return self._asset_response(start_response, DONATION_QR_PATH.read_bytes(), "image/jpeg")
+            except OSError:
+                return self._response(start_response, "Asset not available", "404 Not Found")
         if path == "/api/v1/state" and method == "GET":
             if not self._sync_authorized(environ):
                 return self._json_response(start_response, {"error": "unauthorized"}, "401 Unauthorized")
@@ -254,6 +293,8 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             return self._sync_api(environ, start_response)
         if method == "GET" and path == "/":
             return self._public_home(environ, start_response)
+        if method == "GET" and path == "/faq":
+            return self._faq(start_response)
         match = re.match(r"^/jobs/([a-f0-9]{24})/cover-letter$", path)
         if method == "GET" and match:
             return self._public_letter(match.group(1), start_response)

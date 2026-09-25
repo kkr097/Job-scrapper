@@ -219,6 +219,33 @@ class WebPrivacyTests(unittest.TestCase):
         self.assertNotIn("Krishnakumar Radhakrishna Panicker", sample)
         self.assertIn("Cover letter sample", home)
 
+    def test_guest_donation_and_faq_are_public_without_private_data(self):
+        _, home = self.request("/")
+        _, faq = self.request("/faq")
+        self.assertIn("Buy me a coffee", home)
+        self.assertIn("/static/donation-qr.jpeg", home)
+        self.assertIn("ChatGPT/Codex Cowork", home + faq)
+        self.assertIn("Frequently asked questions", faq)
+        self.assertIn("<details>", faq)
+        self.assertNotIn("rkrishnakumar097@gmail.com", home + faq)
+        self.assertNotIn("Private dashboard", faq)
+
+        captured = {}
+        environ = {
+            "PATH_INFO": "/static/donation-qr.jpeg",
+            "QUERY_STRING": "",
+            "REQUEST_METHOD": "GET",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": io.BytesIO(b""),
+        }
+        def start(status, headers):
+            captured["status"] = status
+            captured["headers"] = headers
+        body = b"".join(self.app(environ, start))
+        self.assertEqual(captured["status"], "200 OK")
+        self.assertIn(("Content-Type", "image/jpeg"), captured["headers"])
+        self.assertTrue(body.startswith(b"\xff\xd8\xff"))
+
     def test_admin_requires_authentication_and_returns_full_letter_after_login(self):
         captured, anonymous = self.request("/admin")
         self.assertTrue(captured["status"].startswith("303"))
