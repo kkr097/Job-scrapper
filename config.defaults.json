@@ -69,6 +69,7 @@
         "excel_file": "daily_jobs.csv"
     },
     "output_nonmatch_file": "daily_jobs_nonmatch.csv",
+    "cover_letter_db": "cover_letters.db",
     "cache_file": "seen_jobs_cache.json",
     "cache_days": 45,
     "min_score": 5,

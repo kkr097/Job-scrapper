@@ -11,6 +11,8 @@ A Python-based job scraper that finds relevant job postings, rates them using AI
 - Scrape/score separation: queue scraped jobs and score later
 - Scheduled scoring: time window + daily limits
 - Manual guardrails: negative-title keyword skip + FIFO `rejected_jobs.csv`
+- Grounded cover-letter queue with versioned evidence, retry-safe batches, and private/public separation
+- Server-rendered job list with redacted guest samples and a password-protected application dashboard
 
 ## Requirements
 
@@ -95,6 +97,54 @@ python main.py --score-only     # Score pending jobs (scheduled mode)
 python main.py --score-only-manual  # Score pending jobs now (no limits)
 python main.py -o custom.csv    # Custom output file
 ```
+
+## Cover Letters and Website
+
+Matched jobs are automatically added to `cover_letters.db`. Cover-letter generation is performed by the personal Codex skill `kk-cover-letter`; the job scraper itself never invents a letter or calls a second LLM.
+
+Run these commands from a valid WSL Python environment:
+
+```bash
+python3 cover_letters.py sync-csv --csv daily_jobs.csv
+python3 cover_letters.py prepare-batch --limit 10
+# Codex writes cover_letter_results.json using the kk-cover-letter skill
+python3 cover_letters.py commit-batch --input cover_letter_results.json
+python3 cover_letters.py prune
+```
+
+Every batch item is isolated. Successful letters are saved immediately; failed items remain queued. A changed job description or evidence-profile version invalidates and requeues the old letter. Missing descriptions are shown as `Cover letter unavailable`.
+
+To create an admin password hash, run `python3 cover_letter_web.py --hash-password`. Store the resulting hash and a long random session secret outside the repository, then start the local server:
+
+```bash
+export COVER_LETTER_ADMIN_PASSWORD_HASH='generated-hash'
+export COVER_LETTER_SECRET_KEY='long-random-secret'
+python3 cover_letter_web.py --host 127.0.0.1 --port 8765
+```
+
+Guest pages contain only the deterministic redacted letter body. Full letters, contact details, application state, and private notes are read only after server-side admin authentication. Public jobs and samples disappear after 28 days; applied-job history remains private.
+
+### Secure cloud synchronization
+
+The deployed website uses PostgreSQL while scraping, scoring, and letter generation remain local. Before pushing website data, synchronization downloads application status, private notes, and regeneration requests into the local SQLite database as a recovery copy.
+
+```bash
+export COVER_LETTER_SYNC_URL='https://your-service.onrender.com'
+export COVER_LETTER_SYNC_TOKEN='same-secret-configured-on-render'
+python3 cover_letters.py sync-cloud
+```
+
+The server ignores any uploaded public sample and derives redacted body text from the validated full letter. Synchronization requires HTTPS except for local testing.
+
+### Render and Supabase deployment
+
+1. Create a Supabase Free project and copy its PostgreSQL pooler connection string.
+2. Deploy this repository on Render using `render.yaml`.
+3. Configure `DATABASE_URL`, `COVER_LETTER_ADMIN_PASSWORD_HASH`, and `COVER_LETTER_SYNC_TOKEN` as Render secrets. Render generates the session secret.
+4. Configure the Render URL and the same synchronization token in the local WSL environment.
+5. Run `python3 cover_letters.py sync-cloud` after generation.
+
+Render Free may sleep after inactivity, and Supabase Free may pause inactive projects. The weekday sync supplies regular database activity; the local SQLite database remains the recovery copy.
 
 ## Key Configuration Options
 

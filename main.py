@@ -26,6 +26,20 @@ from exporter import append_new_to_excel, append_new_to_csv, load_existing_urls,
 from resume_parser import get_resume_summary, generate_config_from_resume, parse_resume
 
 
+def _enqueue_cover_letter(job: dict, config: dict) -> None:
+    """Queue a matched job without allowing this optional feature to stop scoring."""
+    try:
+        from cover_letters import CoverLetterStore
+
+        db_path = os.path.join(
+            os.path.dirname(__file__),
+            config.get("cover_letter_db", "cover_letters.db")
+        )
+        CoverLetterStore(db_path).enqueue_job(job)
+    except Exception as error:
+        print(f"   ⚠ Cover-letter queue unavailable: {error}")
+
+
 def _deep_update(base: dict, override: dict) -> dict:
     """Recursively update dict keys without replacing nested dicts."""
     for key, value in override.items():
@@ -399,7 +413,8 @@ def main():
                 "location": row.get("location", ""),
                 "source": row.get("source", ""),
                 "url": url,
-                "description": row.get("description", "")
+                "description": row.get("description", ""),
+                "first_seen": row.get("first_seen", "")
             }
             if _has_skip_keyword(job):
                 _append_rejected(job)
@@ -428,6 +443,7 @@ def main():
                     if _score_success(job):
                         if job.get("score", 0) >= config.get("min_score", 5):
                             append_new_to_csv([job], daily_path)
+                            _enqueue_cover_letter(job, config)
                         else:
                             append_new_to_csv([job], nonmatch_path)
                         scored_urls.add(url_l)
@@ -602,6 +618,8 @@ def main():
         append_new_to_csv(nonmatches, nonmatch_path)
     else:
         append_new_to_excel(matches, output_path)
+    for job in matches:
+        _enqueue_cover_letter(job, config)
     
     # Summary
     great_matches = len([j for j in jobs if j.get('score', 0) >= 8])
@@ -618,4 +636,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -23,6 +23,13 @@ Thumbs.db
 
 */*.csv
 .env
+cover_letters.db
+cover_letters.db-shm
+cover_letters.db-wal
+cover_letter_batch.json
+cover_letter_results.json
+tests/.tmp/
+tests/.deps/
 /**/*.log
 /**/*.ps1
 /**/*.csv
