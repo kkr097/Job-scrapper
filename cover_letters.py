@@ -17,7 +17,7 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -35,6 +35,8 @@ PROMPT_VERSION = "2026-09-25.1"
 MIN_DESCRIPTION_CHARS = 300
 PUBLIC_RETENTION_DAYS = 28
 ACTIVE_DAYS = 14
+TREND_WINDOW_DAYS = 90
+TREND_RETENTION_DAYS = 100
 MAX_ATTEMPTS = 5
 DEFAULT_DB = "cover_letters.db"
 
@@ -59,6 +61,26 @@ def parse_datetime(value: str | None, fallback: datetime | None = None) -> datet
             except ValueError:
                 pass
     return fallback or utc_now()
+
+
+def prepare_trend_snapshot(raw: dict[str, Any]) -> dict[str, Any]:
+    snapshot_date = str(raw.get("snapshot_date") or "").strip()
+    try:
+        parsed_date = date.fromisoformat(snapshot_date)
+    except ValueError as exc:
+        raise ValueError("invalid trend snapshot date") from exc
+    try:
+        count = int(raw.get("active_14d_count"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid trend snapshot count") from exc
+    if count < 0 or count > 1_000_000:
+        raise ValueError("invalid trend snapshot count")
+    recorded_at = iso_utc(parse_datetime(str(raw.get("recorded_at") or "")))
+    return {
+        "snapshot_date": parsed_date.isoformat(),
+        "active_14d_count": count,
+        "recorded_at": recorded_at,
+    }
 
 
 def normalize_url(url: str) -> str:
@@ -204,6 +226,12 @@ class CoverLetterStore:
                     applied_at TEXT,
                     notes TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS trend_snapshots (
+                    snapshot_date TEXT PRIMARY KEY,
+                    active_14d_count INTEGER NOT NULL CHECK(active_14d_count >= 0),
+                    recorded_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_jobs_first_seen ON jobs(first_seen);
@@ -487,10 +515,50 @@ class CoverLetterStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def record_trend_snapshot(self, snapshot_date: str | None = None, count: int | None = None) -> dict[str, Any]:
+        point = prepare_trend_snapshot({
+            "snapshot_date": snapshot_date or utc_now().date().isoformat(),
+            "active_14d_count": len(self.public_jobs("active")) if count is None else count,
+            "recorded_at": iso_utc(),
+        })
+        self.sync_trend_snapshots([point])
+        return point
+
+    def sync_trend_snapshots(self, records: Iterable[dict[str, Any]]) -> int:
+        prepared = [prepare_trend_snapshot(record) for record in records]
+        cutoff = (utc_now().date() - timedelta(days=TREND_RETENTION_DAYS)).isoformat()
+        with self.connection() as conn:
+            for point in prepared:
+                conn.execute(
+                    """
+                    INSERT INTO trend_snapshots(snapshot_date,active_14d_count,recorded_at)
+                    VALUES(?,?,?)
+                    ON CONFLICT(snapshot_date) DO UPDATE SET
+                        active_14d_count=excluded.active_14d_count,
+                        recorded_at=excluded.recorded_at
+                    """,
+                    (point["snapshot_date"], point["active_14d_count"], point["recorded_at"]),
+                )
+            conn.execute("DELETE FROM trend_snapshots WHERE snapshot_date < ?", (cutoff,))
+        return len(prepared)
+
+    def trend_snapshots(self, days: int = TREND_WINDOW_DAYS) -> list[dict[str, Any]]:
+        cutoff = (utc_now().date() - timedelta(days=max(1, days) - 1)).isoformat()
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT snapshot_date,active_14d_count,recorded_at
+                FROM trend_snapshots WHERE snapshot_date >= ? ORDER BY snapshot_date
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def import_cloud_state(self, state: dict[str, Any]) -> dict[str, int]:
         """Back up cloud-only application state and apply regeneration requests."""
         applications = state.get("applications") or []
         requests = state.get("regeneration_requests") or []
+        snapshots = state.get("trend_snapshots") or []
         imported = regenerated = 0
         with self.connection() as conn:
             for item in applications:
@@ -532,7 +600,12 @@ class CoverLetterStore:
                     (requested_at, job_id, requested_at),
                 ).rowcount
                 regenerated += int(changed > 0)
-        return {"applications": imported, "regeneration_requests": regenerated}
+        imported_snapshots = self.sync_trend_snapshots(snapshots)
+        return {
+            "applications": imported,
+            "regeneration_requests": regenerated,
+            "trend_snapshots": imported_snapshots,
+        }
 
     def cloud_state(self) -> dict[str, list[dict[str, Any]]]:
         """Expose syncable private state when running the website locally."""
@@ -549,6 +622,7 @@ class CoverLetterStore:
         return {
             "applications": [dict(row) for row in applications],
             "regeneration_requests": [dict(row) for row in requests],
+            "trend_snapshots": self.trend_snapshots(TREND_RETENTION_DAYS),
         }
 
     def sync_jobs(self, records: Iterable[dict[str, Any]]) -> int:
@@ -590,11 +664,13 @@ class CoverLetterStore:
         state_response = requests.get(f"{base_url}/api/v1/state", headers=headers, timeout=30)
         state_response.raise_for_status()
         pulled = self.import_cloud_state(state_response.json())
+        self.record_trend_snapshot()
         records = self.sync_records()
+        snapshots = self.trend_snapshots(TREND_RETENTION_DAYS)
         push_response = requests.post(
             f"{base_url}/api/v1/sync",
             headers={**headers, "Content-Type": "application/json"},
-            json={"jobs": records},
+            json={"jobs": records, "trend_snapshots": snapshots},
             timeout=60,
         )
         push_response.raise_for_status()
@@ -608,8 +684,9 @@ class CoverLetterStore:
 
     def prune(self) -> int:
         cutoff = iso_utc(utc_now() - timedelta(days=PUBLIC_RETENTION_DAYS))
+        trend_cutoff = (utc_now().date() - timedelta(days=TREND_RETENTION_DAYS)).isoformat()
         with self.connection() as conn:
-            return conn.execute(
+            deleted = conn.execute(
                 """
                 DELETE FROM jobs
                 WHERE COALESCE(posted_at,first_seen) < ?
@@ -617,6 +694,8 @@ class CoverLetterStore:
                 """,
                 (cutoff,),
             ).rowcount
+            conn.execute("DELETE FROM trend_snapshots WHERE snapshot_date < ?", (trend_cutoff,))
+            return deleted
 
 
 def _write_json(path: str, payload: Any) -> None:

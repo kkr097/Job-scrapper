@@ -11,12 +11,15 @@ from cover_letters import (
     EVIDENCE_VERSION,
     PROMPT_VERSION,
     PUBLIC_RETENTION_DAYS,
+    TREND_RETENTION_DAYS,
+    TREND_WINDOW_DAYS,
     description_hash,
     iso_utc,
     job_id_for_url,
     make_public_sample,
     normalize_url,
     parse_datetime,
+    prepare_trend_snapshot,
     utc_now,
     validate_cover_letter,
 )
@@ -165,6 +168,15 @@ class PostgresCoverLetterStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trend_snapshots (
+                    snapshot_date TEXT PRIMARY KEY,
+                    active_14d_count INTEGER NOT NULL CHECK(active_14d_count >= 0),
+                    recorded_at TEXT NOT NULL
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cloud_jobs_first_seen ON jobs(first_seen)")
 
     def sync_jobs(self, records: Iterable[dict[str, Any]]) -> int:
@@ -254,6 +266,45 @@ class PostgresCoverLetterStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def record_trend_snapshot(self, snapshot_date: str | None = None, count: int | None = None) -> dict[str, Any]:
+        point = prepare_trend_snapshot({
+            "snapshot_date": snapshot_date or utc_now().date().isoformat(),
+            "active_14d_count": len(self.public_jobs("active")) if count is None else count,
+            "recorded_at": iso_utc(),
+        })
+        self.sync_trend_snapshots([point])
+        return point
+
+    def sync_trend_snapshots(self, records: Iterable[dict[str, Any]]) -> int:
+        prepared = [prepare_trend_snapshot(record) for record in records]
+        cutoff = (utc_now().date() - timedelta(days=TREND_RETENTION_DAYS)).isoformat()
+        with self.connection() as conn:
+            for point in prepared:
+                conn.execute(
+                    """
+                    INSERT INTO trend_snapshots(snapshot_date,active_14d_count,recorded_at)
+                    VALUES(%s,%s,%s)
+                    ON CONFLICT(snapshot_date) DO UPDATE SET
+                        active_14d_count=excluded.active_14d_count,
+                        recorded_at=excluded.recorded_at
+                    """,
+                    (point["snapshot_date"], point["active_14d_count"], point["recorded_at"]),
+                )
+            conn.execute("DELETE FROM trend_snapshots WHERE snapshot_date < %s", (cutoff,))
+        return len(prepared)
+
+    def trend_snapshots(self, days: int = TREND_WINDOW_DAYS) -> list[dict[str, Any]]:
+        cutoff = (utc_now().date() - timedelta(days=max(1, days) - 1)).isoformat()
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT snapshot_date,active_14d_count,recorded_at
+                FROM trend_snapshots WHERE snapshot_date >= %s ORDER BY snapshot_date
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_public_job(self, job_id: str) -> dict[str, Any] | None:
         return next((job for job in self.public_jobs() if job["job_id"] == job_id), None)
 
@@ -301,12 +352,14 @@ class PostgresCoverLetterStore:
         return {
             "applications": [dict(row) for row in applications],
             "regeneration_requests": [dict(row) for row in requests],
+            "trend_snapshots": self.trend_snapshots(TREND_RETENTION_DAYS),
         }
 
     def prune(self) -> int:
         cutoff = iso_utc(utc_now() - timedelta(days=PUBLIC_RETENTION_DAYS))
+        trend_cutoff = (utc_now().date() - timedelta(days=TREND_RETENTION_DAYS)).isoformat()
         with self.connection() as conn:
-            return conn.execute(
+            deleted = conn.execute(
                 """
                 DELETE FROM jobs
                 WHERE COALESCE(posted_at,first_seen) < %s
@@ -314,3 +367,5 @@ class PostgresCoverLetterStore:
                 """,
                 (cutoff,),
             ).rowcount
+            conn.execute("DELETE FROM trend_snapshots WHERE snapshot_date < %s", (trend_cutoff,))
+            return deleted

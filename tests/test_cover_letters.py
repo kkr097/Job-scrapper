@@ -152,6 +152,40 @@ class CoverLetterStoreTests(unittest.TestCase):
         self.assertEqual(refreshed["status"], "queued")
         self.assertIsNone(refreshed["full_text"])
 
+    def test_trend_snapshots_are_idempotent_sparse_and_retained(self):
+        today = utc_now().date()
+        weekday = (today - timedelta(days=2)).isoformat()
+        older = (today - timedelta(days=101)).isoformat()
+        self.assertEqual(self.store.sync_trend_snapshots([
+            {"snapshot_date": weekday, "active_14d_count": 4, "recorded_at": iso_utc()},
+            {"snapshot_date": older, "active_14d_count": 99, "recorded_at": iso_utc()},
+        ]), 2)
+        self.assertEqual(self.store.sync_trend_snapshots([
+            {"snapshot_date": weekday, "active_14d_count": 7, "recorded_at": iso_utc()},
+        ]), 1)
+        self.store.record_trend_snapshot(today.isoformat(), 11)
+        points = self.store.trend_snapshots(90)
+        self.assertEqual([(row["snapshot_date"], row["active_14d_count"]) for row in points], [
+            (weekday, 7),
+            (today.isoformat(), 11),
+        ])
+        state = self.store.cloud_state()
+        self.assertEqual(state["trend_snapshots"], points)
+
+    def test_cloud_state_import_restores_trend_history(self):
+        snapshot = {
+            "snapshot_date": utc_now().date().isoformat(),
+            "active_14d_count": 12,
+            "recorded_at": iso_utc(),
+        }
+        result = self.store.import_cloud_state({
+            "applications": [],
+            "regeneration_requests": [],
+            "trend_snapshots": [snapshot],
+        })
+        self.assertEqual(result["trend_snapshots"], 1)
+        self.assertEqual(self.store.trend_snapshots(), [snapshot])
+
 
 class CloudPayloadTests(unittest.TestCase):
     def test_server_derives_redaction_and_rejects_mismatched_id(self):
@@ -220,13 +254,21 @@ class WebPrivacyTests(unittest.TestCase):
         self.assertIn("Cover letter sample", home)
 
     def test_guest_donation_and_faq_are_public_without_private_data(self):
+        self.store.record_trend_snapshot(utc_now().date().isoformat(), 1)
         _, home = self.request("/")
         _, faq = self.request("/faq")
         self.assertIn("Buy me a coffee", home)
         self.assertIn("/static/donation-qr.jpeg", home)
-        self.assertIn("ChatGPT/Codex Cowork", home + faq)
+        self.assertIn('<dialog id="donation-dialog"', home)
+        self.assertNotIn('<section class="card donation">', home)
+        self.assertLess(home.index('<dialog id="donation-dialog"'), home.index('/static/donation-qr.jpeg'))
+        self.assertNotIn("ChatGPT/Codex Cowork", home)
+        self.assertIn("ChatGPT/Codex Cowork", faq)
         self.assertIn("Frequently asked questions", faq)
         self.assertIn("<details>", faq)
+        self.assertIn("Jobs in last 14 days — 3-month trend", home)
+        self.assertIn("Trend history starts today", home)
+        self.assertIn('role="img"', home)
         self.assertNotIn("rkrishnakumar097@gmail.com", home + faq)
         self.assertNotIn("Private dashboard", faq)
 

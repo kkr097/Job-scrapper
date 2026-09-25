@@ -12,13 +12,13 @@ import os
 import re
 import secrets
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http import cookies
 from pathlib import Path
 from typing import Any, Callable
 from wsgiref.simple_server import make_server
 
-from cover_letters import CoverLetterStore, DEFAULT_DB
+from cover_letters import CoverLetterStore, DEFAULT_DB, prepare_trend_snapshot, utc_now
 
 
 SESSION_COOKIE = "kk_cover_admin"
@@ -163,7 +163,54 @@ class CoverLetterWebApp:
 <style>
 :root{{--ink:#0a0a0a;--paper:#fff;--line:#d9d9d9;--muted:#696969}}*{{box-sizing:border-box}}
 body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 Arial,sans-serif}}header{{display:flex;justify-content:space-between;align-items:center;padding:22px 5vw;border-bottom:1px solid var(--line)}}
-</style></head><body><header><strong>KK JOBS</strong><nav>{nav}</nav></header><main>{content}</main><footer class="meta" style="max-width:1180px;margin:auto;padding:0 5vw 34px">Developed by KK with help from ChatGPT/Codex Cowork.</footer></body></html>"""
+header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px}}a{{color:inherit}}main{{max-width:1180px;margin:auto;padding:44px 5vw}}h1{{font-size:clamp(2.3rem,6vw,5.6rem);line-height:.98;max-width:900px;margin:0 0 38px}}h2{{margin-top:34px}}.meta{{color:var(--muted);font-size:.88rem}}.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:0 0 30px}}.stat{{border:1px solid var(--line);padding:22px}}.stat b{{display:block;font-size:2.5rem}}.support-tile{{width:100%;border:1px solid var(--line);border-radius:0;background:var(--paper);color:var(--ink);padding:22px;text-align:left;cursor:pointer}}.support-tile:hover,.support-tile:focus-visible{{background:#f5f5f5}}.support-tile b{{font-size:1.45rem;line-height:1.2}}.toolbar{{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 28px}}select,input,textarea,button{{font:inherit;padding:10px 12px;border:1px solid var(--ink);background:#fff}}button,.pill{{border-radius:999px;background:#0a0a0a;color:#fff;padding:10px 18px;text-decoration:none;display:inline-block}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:14px 10px;border-bottom:1px solid var(--line);vertical-align:top}}.expired{{color:#777}}pre{{white-space:pre-wrap;font:inherit;border:1px solid var(--line);padding:24px}}.card{{border:1px solid var(--line);padding:24px;margin:18px 0}}.trend-card{{border:1px solid var(--line);padding:22px;margin:0 0 30px}}.trend-card h2{{margin:0 0 4px}}.trend-card svg{{display:block;width:100%;height:auto;margin-top:14px}}dialog{{width:min(92vw,520px);border:1px solid var(--ink);padding:28px;background:var(--paper);color:var(--ink)}}dialog::backdrop{{background:rgba(0,0,0,.65)}}dialog h2{{margin:0 44px 10px 0}}dialog img{{display:block;width:min(100%,320px);height:auto;margin:22px auto 0}}.dialog-close{{float:right;margin:-8px -8px 8px 12px}}.error{{color:#9b1c1c}}textarea{{display:block;width:100%;min-height:70px;margin:10px 0}}@media(max-width:760px){{header{{align-items:flex-start;gap:18px}}nav{{gap:14px;flex-wrap:wrap;justify-content:flex-end}}table,thead,tbody,tr,th,td{{display:block}}thead{{display:none}}td{{padding:5px 0;border:0}}tr{{padding:18px 0;border-bottom:1px solid var(--line)}}dialog{{padding:22px}}}}
+</style></head><body><header><strong>KK JOBS</strong><nav>{nav}</nav></header><main>{content}</main></body></html>"""
+
+    @staticmethod
+    def _trend_chart(points: list[dict[str, Any]]) -> str:
+        today = utc_now().date()
+        start = today - timedelta(days=89)
+        clean: list[tuple[date, int]] = []
+        for point in points:
+            try:
+                point_date = date.fromisoformat(str(point["snapshot_date"]))
+                count = max(0, int(point["active_14d_count"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start <= point_date <= today:
+                clean.append((point_date, count))
+        clean.sort(key=lambda item: item[0])
+        heading = '<h2>Jobs in last 14 days — 3-month trend</h2>'
+        if not clean:
+            return f'<section class="trend-card">{heading}<p class="meta">Trend history starts with the next successful website synchronization.</p></section>'
+
+        width, height = 800, 220
+        left, right, top, bottom = 48, 18, 18, 34
+        plot_width = width - left - right
+        plot_height = height - top - bottom
+        maximum = max(1, max(count for _, count in clean))
+
+        def coordinates(point_date: date, count: int) -> tuple[float, float]:
+            x = left + ((point_date - start).days / 89) * plot_width
+            y = top + ((maximum - count) / maximum) * plot_height
+            return x, y
+
+        plotted = [(point_date, count, *coordinates(point_date, count)) for point_date, count in clean]
+        polyline = " ".join(f"{x:.1f},{y:.1f}" for _, _, x, y in plotted)
+        line = f'<polyline points="{polyline}" fill="none" stroke="#0a0a0a" stroke-width="3" vector-effect="non-scaling-stroke"/>' if len(plotted) > 1 else ""
+        circles = "".join(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#0a0a0a"><title>{html.escape(point_date.isoformat())}: {count} jobs</title></circle>'
+            for point_date, count, x, y in plotted
+        )
+        grid = "".join(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}" stroke="#d9d9d9"/><text x="{left-8}" y="{y+4:.1f}" text-anchor="end" font-size="12" fill="#696969">{value}</text>'
+            for value, y in ((maximum, top), (maximum // 2, top + plot_height / 2), (0, top + plot_height))
+        )
+        note = '<p class="meta">Trend history starts today and will fill during weekday synchronizations.</p>' if len(clean) == 1 else '<p class="meta">Recorded during successful weekday website synchronizations.</p>'
+        svg = f'''<svg viewBox="0 0 {width} {height}" role="img" aria-labelledby="trend-title trend-desc">
+<title id="trend-title">Jobs in the last 14 days over three months</title><desc id="trend-desc">{len(clean)} recorded snapshots. Latest value: {clean[-1][1]} jobs.</desc>
+{grid}{line}{circles}<text x="{left}" y="{height-8}" font-size="12" fill="#696969">{start.strftime('%d %b')}</text><text x="{width-right}" y="{height-8}" text-anchor="end" font-size="12" fill="#696969">{today.strftime('%d %b')}</text></svg>'''
+        return f'<section class="trend-card">{heading}{note}{svg}</section>'
 
     def _public_home(self, environ: dict, start_response: Callable):
         query = dict(urllib.parse.parse_qsl(environ.get("QUERY_STRING", "")))
@@ -172,10 +219,12 @@ body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 Arial,sans
             min_score = float(query["score"]) if query.get("score") else None
         except ValueError:
             min_score = None
-        all_jobs = self.store.public_jobs("all", min_score)
-        jobs = all_jobs if view == "all" else [job for job in all_jobs if job["age_status"] == view]
-        active_count = sum(job["age_status"] == "active" for job in all_jobs)
-        expired_count = sum(job["age_status"] == "expired" for job in all_jobs)
+        summary_jobs = self.store.public_jobs("all")
+        filtered_jobs = self.store.public_jobs("all", min_score)
+        jobs = filtered_jobs if view == "all" else [job for job in filtered_jobs if job["age_status"] == view]
+        active_count = sum(job["age_status"] == "active" for job in summary_jobs)
+        expired_count = sum(job["age_status"] == "expired" for job in summary_jobs)
+        trend = self._trend_chart(self.store.trend_snapshots())
         rows = []
         for job in jobs:
             status_class = "expired" if job["age_status"] == "expired" else ""
@@ -183,10 +232,12 @@ body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 Arial,sans
             date = str(job.get("posted_at") or job.get("first_seen") or "")[:10]
             rows.append(f'<tr class="{status_class}"><td><a href="{html.escape(job["url"], quote=True)}" rel="noopener noreferrer">{html.escape(job["title"])}</a><div class="meta">{html.escape(job["company"])}</div></td><td>{html.escape(date)}</td><td>{html.escape(job["source"])}</td><td>{html.escape(str(job["score"] or ""))}</td><td>{html.escape(job["age_status"].title())}</td><td>{letter}</td></tr>')
         content = f"""<p class="meta">CURATED JOBS · LAST 28 DAYS</p><h1>Relevant work, without the noise.</h1>
-<section class="stats"><div class="stat"><span>Jobs in last 14 days</span><b>{active_count}</b></div><div class="stat"><span>Expired jobs, days 15–28</span><b>{expired_count}</b></div></section>
-<section class="card donation"><h2>Buy me a coffee</h2><p>If this job collection saves you time, you can support the project voluntarily. Scan the PayPal QR code with your phone.</p><img src="/static/donation-qr.jpeg" alt="PayPal donation QR code for Krishnakumar Radhakrishna Panicker" loading="lazy" width="320" height="360"></section>
+<section class="stats"><div class="stat"><span>Jobs in last 14 days</span><b>{active_count}</b></div><div class="stat"><span>Expired jobs, days 15–28</span><b>{expired_count}</b></div><button class="stat support-tile" type="button" id="open-donation" aria-haspopup="dialog" aria-controls="donation-dialog"><b>Buy me a coffee</b></button></section>
+{trend}
 <form class="toolbar" method="get"><label>Status <select name="view"><option value="all">All</option><option value="active" {'selected' if view=='active' else ''}>Last 14 days</option><option value="expired" {'selected' if view=='expired' else ''}>Days 15–28</option></select></label><label>Minimum score <input name="score" type="number" min="0" max="10" value="{html.escape(query.get('score',''))}"></label><button>Filter</button></form>
-<table><thead><tr><th>Job</th><th>Date</th><th>Source</th><th>Score</th><th>Status</th><th>Letter</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="6">No jobs match these filters.</td></tr>'}</tbody></table>"""
+<table><thead><tr><th>Job</th><th>Date</th><th>Source</th><th>Score</th><th>Status</th><th>Letter</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="6">No jobs match these filters.</td></tr>'}</tbody></table>
+<dialog id="donation-dialog" aria-labelledby="donation-title"><button class="dialog-close" type="button" id="close-donation" aria-label="Close donation popup">Close</button><h2 id="donation-title">Buy me a coffee</h2><p>This website saves time by collecting, filtering, and scoring relevant jobs from LinkedIn, XING, and employer career pages. It provides direct application links and redacted cover-letter examples in one place.</p><p>Support is completely voluntary. If the website helps you, scan the PayPal QR code with your phone to support its running costs and continued improvement.</p><img src="/static/donation-qr.jpeg" alt="PayPal donation QR code for Krishnakumar Radhakrishna Panicker" loading="lazy" width="320" height="360"></dialog>
+<script>(()=>{{const modal=document.getElementById('donation-dialog');const open=document.getElementById('open-donation');const close=document.getElementById('close-donation');open.addEventListener('click',()=>{{modal.showModal();close.focus();}});close.addEventListener('click',()=>modal.close());modal.addEventListener('click',event=>{{const box=modal.getBoundingClientRect();if(event.clientX<box.left||event.clientX>box.right||event.clientY<box.top||event.clientY>box.bottom)modal.close();}});}})();</script>"""
         return self._response(start_response, self._layout("KK Jobs", content))
 
     def _faq(self, start_response: Callable):
@@ -265,11 +316,22 @@ body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 Arial,sans
         try:
             payload = self._read_json(environ)
             jobs = payload.get("jobs")
+            snapshots = payload.get("trend_snapshots") or []
             if not isinstance(jobs, list):
                 raise ValueError("jobs must be a list")
             if len(jobs) > 2500:
                 raise ValueError("too many jobs in one request")
-            return self._json_response(start_response, {"synced": self.store.sync_jobs(jobs)})
+            if not isinstance(snapshots, list) or len(snapshots) > 120:
+                raise ValueError("trend_snapshots must be a list of at most 120 items")
+            prepared_snapshots = [prepare_trend_snapshot(item) for item in snapshots]
+            synced_jobs = self.store.sync_jobs(jobs)
+            synced_snapshots = self.store.sync_trend_snapshots(prepared_snapshots)
+            current = self.store.record_trend_snapshot()
+            return self._json_response(start_response, {
+                "synced": synced_jobs,
+                "trend_snapshots": synced_snapshots,
+                "current_snapshot": current,
+            })
         except (ValueError, json.JSONDecodeError) as exc:
             return self._json_response(start_response, {"error": str(exc)}, "400 Bad Request")
 
