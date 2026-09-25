@@ -19,6 +19,7 @@ from cover_letters import (
     make_public_sample,
     normalize_url,
     parse_datetime,
+    public_sort_order,
     prepare_trend_snapshot,
     utc_now,
     validate_cover_letter,
@@ -225,7 +226,14 @@ class PostgresCoverLetterStore:
         self.prune()
         return len(prepared)
 
-    def public_jobs(self, view: str = "all", min_score: float | None = None) -> list[dict[str, Any]]:
+    def public_jobs(
+        self,
+        view: str = "all",
+        min_score: float | None = None,
+        primary_sort: str = "date_desc",
+        secondary_sort: str | None = "score_desc",
+    ) -> list[dict[str, Any]]:
+        order_by = public_sort_order(primary_sort, secondary_sort)
         cutoff = iso_utc(utc_now() - timedelta(days=PUBLIC_RETENTION_DAYS))
         active_cutoff = iso_utc(utc_now() - timedelta(days=ACTIVE_DAYS))
         conditions = ["COALESCE(j.posted_at,j.first_seen) >= %s"]
@@ -247,7 +255,7 @@ class PostgresCoverLetterStore:
                        CASE WHEN COALESCE(j.posted_at,j.first_seen) >= %s THEN 'active' ELSE 'expired' END AS age_status
                 FROM jobs j JOIN cover_letters c USING(job_id)
                 WHERE {' AND '.join(conditions)}
-                ORDER BY COALESCE(j.posted_at,j.first_seen) DESC,j.score DESC NULLS LAST
+                ORDER BY {order_by}
                 """,
                 (active_cutoff, *params),
             ).fetchall()

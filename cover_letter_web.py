@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 from wsgiref.simple_server import make_server
 
-from cover_letters import CoverLetterStore, DEFAULT_DB, prepare_trend_snapshot, utc_now
+from cover_letters import CoverLetterStore, DEFAULT_DB, PUBLIC_SORT_MODES, prepare_trend_snapshot, utc_now
 
 
 SESSION_COOKIE = "kk_cover_admin"
@@ -180,7 +180,7 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             if start <= point_date <= today:
                 clean.append((point_date, count))
         clean.sort(key=lambda item: item[0])
-        heading = '<h2>Jobs in last 14 days — 3-month trend</h2>'
+        heading = '<h2>3 Month Job Trend</h2>'
         if not clean:
             return f'<section class="trend-card">{heading}<p class="meta">Trend history starts with the next successful website synchronization.</p></section>'
 
@@ -219,8 +219,32 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             min_score = float(query["score"]) if query.get("score") else None
         except ValueError:
             min_score = None
+        primary_sort = query.get("sort", "date_desc")
+        if primary_sort not in PUBLIC_SORT_MODES:
+            primary_sort = "date_desc"
+        secondary_raw = query.get("then", "score_desc")
+        secondary_sort = None if secondary_raw == "none" else secondary_raw
+        if secondary_sort not in PUBLIC_SORT_MODES:
+            secondary_sort = "score_desc"
+        if secondary_sort and PUBLIC_SORT_MODES[secondary_sort][0] == PUBLIC_SORT_MODES[primary_sort][0]:
+            secondary_sort = None
+
+        sort_labels = (
+            ("date_desc", "Latest published"),
+            ("date_asc", "Oldest published"),
+            ("score_desc", "Highest score"),
+            ("score_asc", "Lowest score"),
+        )
+        primary_options = "".join(
+            f'<option value="{value}"{" selected" if value == primary_sort else ""}>{label}</option>'
+            for value, label in sort_labels
+        )
+        secondary_options = '<option value="none"{}>None</option>'.format(" selected" if secondary_sort is None else "") + "".join(
+            f'<option value="{value}"{" selected" if value == secondary_sort else ""}>{label}</option>'
+            for value, label in sort_labels
+        )
         summary_jobs = self.store.public_jobs("all")
-        filtered_jobs = self.store.public_jobs("all", min_score)
+        filtered_jobs = self.store.public_jobs("all", min_score, primary_sort, secondary_sort)
         jobs = filtered_jobs if view == "all" else [job for job in filtered_jobs if job["age_status"] == view]
         active_count = sum(job["age_status"] == "active" for job in summary_jobs)
         expired_count = sum(job["age_status"] == "expired" for job in summary_jobs)
@@ -234,7 +258,7 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
         content = f"""<p class="meta">CURATED JOBS · LAST 28 DAYS</p><h1>Relevant work, without the noise.</h1>
 <section class="stats"><div class="stat"><span>Jobs in last 14 days</span><b>{active_count}</b></div><div class="stat"><span>Expired jobs, days 15–28</span><b>{expired_count}</b></div><button class="stat support-tile" type="button" id="open-donation" aria-haspopup="dialog" aria-controls="donation-dialog"><b>Buy me a coffee</b></button></section>
 {trend}
-<form class="toolbar" method="get"><label>Status <select name="view"><option value="all">All</option><option value="active" {'selected' if view=='active' else ''}>Last 14 days</option><option value="expired" {'selected' if view=='expired' else ''}>Days 15–28</option></select></label><label>Minimum score <input name="score" type="number" min="0" max="10" value="{html.escape(query.get('score',''))}"></label><button>Filter</button></form>
+<form class="toolbar" method="get"><label>Status <select name="view"><option value="all">All</option><option value="active" {'selected' if view=='active' else ''}>Last 14 days</option><option value="expired" {'selected' if view=='expired' else ''}>Days 15–28</option></select></label><label>Minimum score <input name="score" type="number" min="0" max="10" value="{html.escape(query.get('score',''))}"></label><label>Sort first <select name="sort">{primary_options}</select></label><label>Then by <select name="then">{secondary_options}</select></label><button>Apply</button></form>
 <table><thead><tr><th>Job</th><th>Date</th><th>Source</th><th>Score</th><th>Status</th><th>Letter</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="6">No jobs match these filters.</td></tr>'}</tbody></table>
 <dialog id="donation-dialog" aria-labelledby="donation-title"><button class="dialog-close" type="button" id="close-donation" aria-label="Close donation popup">Close</button><h2 id="donation-title">Buy me a coffee</h2><p>This website saves time by collecting, filtering, and scoring relevant jobs from LinkedIn, XING, and employer career pages. It provides direct application links and redacted cover-letter examples in one place.</p><p>Support is completely voluntary. If the website helps you, scan the PayPal QR code with your phone to support its running costs and continued improvement.</p><img src="/static/donation-qr.jpeg" alt="PayPal donation QR code for Krishnakumar Radhakrishna Panicker" loading="lazy" width="320" height="360"></dialog>
 <script>(()=>{{const modal=document.getElementById('donation-dialog');const open=document.getElementById('open-donation');const close=document.getElementById('close-donation');open.addEventListener('click',()=>{{modal.showModal();close.focus();}});close.addEventListener('click',()=>modal.close());modal.addEventListener('click',event=>{{const box=modal.getBoundingClientRect();if(event.clientX<box.left||event.clientX>box.right||event.clientY<box.top||event.clientY>box.bottom)modal.close();}});}})();</script>"""
@@ -242,21 +266,29 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
 
     def _faq(self, start_response: Callable):
         content = """<p class="meta">ABOUT THIS PROJECT</p><h1>Frequently asked questions</h1>
-<p>This is a personal job-curation project developed by KK with help from ChatGPT/Codex Cowork. The job links and application decisions remain yours.</p>
-<section class="card"><h2>Jobs</h2>
-<details><summary>Where do these jobs come from?</summary><p>The list is collected from LinkedIn, XING, and selected employer career pages. Each job title links to the original source where you can apply.</p></details>
-<details><summary>How often is the list updated?</summary><p>Scraping and scoring run automatically Monday through Friday in the evening. The website is synchronized afterward. There are no scheduled weekend runs.</p></details>
-<details><summary>What does the matching score mean?</summary><p>It is an automated relevance aid based on the project’s configured profile. It is not a guarantee that a job is suitable or that an application will succeed.</p></details>
-<details><summary>Why are some jobs marked expired?</summary><p>Jobs remain publicly visible for up to 28 days. The “expired” view contains older jobs from that window, while older public records are removed.</p></details></section>
-<section class="card"><h2>Applications and cover letters</h2>
-<details><summary>Where do I apply?</summary><p>Use the job title link to open the original LinkedIn, XING, or employer page and apply there.</p></details>
-<details><summary>What is a cover-letter sample?</summary><p>It is a redacted example shown to visitors. Personal contact details, the signature, private notes, and application status are omitted.</p></details>
-<details><summary>Why is a cover letter sometimes unavailable?</summary><p>A grounded letter is created only when the job description contains enough evidence to match the candidate profile. Missing or inadequate descriptions are intentionally marked unavailable.</p></details>
-<details><summary>Can visitors see the complete letters or application tracking?</summary><p>No. Only KK’s authenticated private dashboard contains complete letters, application status, and private notes.</p></details></section>
-<section class="card"><h2>Privacy and support</h2>
-<details><summary>What personal information is public?</summary><p>The public site shows job information and redacted letter samples only. Private application data is protected on the server.</p></details>
-<details><summary>How can I support this project?</summary><p>Support is completely voluntary. Scan the PayPal QR code on the jobs page if the project is useful to you.</p></details>
-<details><summary>Who created this?</summary><p>KK developed the idea and the website with help from ChatGPT/Codex Cowork. Candidate facts and application decisions are based on KK’s own documents and choices.</p></details></section>"""
+<p>KK created this project to turn a fragmented evening job search into one focused list. It gathers relevant vacancies, estimates their fit, links back to the original posting, and makes the useful results available to friends without requiring an account or ChatGPT.</p>
+<section class="card"><h2>Purpose and workflow</h2>
+<details><summary>What problem does this project solve?</summary><p>Relevant vacancies are spread across several platforms, repeated searches take time, and promising roles are easy to miss. The project brings recent results into one searchable place so visitors can spend more time evaluating and applying.</p></details>
+<details><summary>How does a job reach this website?</summary><p>An automated weekday workflow collects vacancies from LinkedIn, XING, and selected employer career pages. A locally operated language model scores their relevance. Matching jobs are prepared for the website, optional cover letters are generated separately, and the approved public information is synchronized to the hosted site.</p></details>
+<details><summary>How often is the website updated?</summary><p>Collection and scoring are scheduled Monday through Friday in the evening, followed by cover-letter processing and website synchronization. There are no scheduled weekend runs, and a failed source or interrupted run can delay an update.</p></details>
+<details><summary>Is every available job guaranteed to appear?</summary><p>No. Search platforms can change their pages, limit automated access, omit results, or remove postings. This project reduces search effort but cannot guarantee complete coverage.</p></details></section>
+<section class="card"><h2>Using the job list</h2>
+<details><summary>Where do I apply?</summary><p>Select the job title to open the original LinkedIn, XING, or employer page. Applications are always completed on the original source, not on this website.</p></details>
+<details><summary>How do filtering and sorting work?</summary><p>Status limits the age window and Minimum score removes results below a chosen score. Sort first controls the main order. Then by breaks ties using a second field. Date and score can therefore be sorted independently or together.</p></details>
+<details><summary>Which date is displayed?</summary><p>The source-provided publication date is used when it is available. If a reliable publication date was not supplied, the website uses the date on which the project first discovered the job.</p></details>
+<details><summary>What does the matching score mean?</summary><p>The score is an automated relevance estimate against the project’s configured candidate profile. It helps prioritize reading, but it does not predict interview selection, application success, job quality, or suitability for a different person.</p></details>
+<details><summary>What do active and expired mean here?</summary><p>Active jobs are from the most recent 14-day window. “Expired” means the record is 15–28 days old within this project; it is not necessarily confirmed closed by the employer. The original link may remain open or may already have disappeared.</p></details>
+<details><summary>What does the 3 Month Job Trend show?</summary><p>Each successful weekday synchronization records the number shown in “Jobs in last 14 days.” The graph uses only genuine snapshots, so weekends and failed runs can appear as gaps and unavailable history is not invented.</p></details></section>
+<section class="card"><h2>Cover letters and privacy</h2>
+<details><summary>What is a cover-letter sample?</summary><p>It is a redacted example generated for KK using evidence from his reviewed career documents and the specific job description. Visitors can use it for inspiration, but it is not a truthful application for another person and should not be copied unchanged.</p></details>
+<details><summary>Why is a cover letter sometimes unavailable?</summary><p>A letter is produced only when the job description contains enough information for a grounded result. Missing or inadequate descriptions are marked unavailable instead of being filled with invented claims.</p></details>
+<details><summary>What can guests see?</summary><p>Guests can view job information, original links, age and score data, the trend, and redacted letter samples. They do not need an account or ChatGPT. Complete letters, application status, private notes, and administrative actions remain available only in KK’s authenticated dashboard.</p></details>
+<details><summary>What personal information is protected?</summary><p>Public letter samples remove contact details, signatures, private notes, and application tracking. Authorization and redaction are enforced by the server rather than relying on the visitor’s browser.</p></details></section>
+<section class="card"><h2>Technology, AI, and support</h2>
+<details><summary>What technology powers the project?</summary><p>The workflow is written in Python. LM Studio runs the local scoring model, SQLite keeps the recoverable local copy, Supabase stores the hosted data, and Render serves the public website. Scheduled automation connects the stages.</p></details>
+<details><summary>How were ChatGPT and Codex Cowork involved?</summary><p>KK developed the idea and made the product decisions with help from ChatGPT/Codex Cowork for planning, implementation, testing, automation, and cover-letter generation. Candidate claims remain grounded in KK’s reviewed documents, while job and application decisions remain human choices.</p></details>
+<details><summary>How long is information retained?</summary><p>Public jobs remain visible for no more than 28 days. Trend snapshots cover approximately three months. KK’s private applied-job history can be preserved separately from the guest-facing list.</p></details>
+<details><summary>How can I support the project?</summary><p>Support is completely voluntary. The Buy me a coffee tile on the jobs page opens a PayPal QR code for anyone who finds the project useful and wants to support its running costs and continued improvement.</p></details></section>"""
         return self._response(start_response, self._layout("FAQ", content))
 
     def _public_letter(self, job_id: str, start_response: Callable):

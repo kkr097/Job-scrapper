@@ -186,6 +186,49 @@ class CoverLetterStoreTests(unittest.TestCase):
         self.assertEqual(result["trend_snapshots"], 1)
         self.assertEqual(self.store.trend_snapshots(), [snapshot])
 
+    def test_public_jobs_support_independent_and_combined_sorting(self):
+        now = utc_now()
+        fixtures = [
+            ("a", now - timedelta(days=1), 5),
+            ("b", now - timedelta(days=1), 9),
+            ("c", now - timedelta(days=2), 10),
+            ("d", None, None),
+        ]
+        for suffix, posted_at, score in fixtures:
+            job = self.job(
+                f"https://example.test/jobs/{suffix}",
+                first_seen=iso_utc(now - timedelta(days=3) if suffix == "d" else now),
+            )
+            job["score"] = score
+            if posted_at:
+                job["posted_at"] = iso_utc(posted_at)
+            job["title"] = suffix.upper()
+            self.store.enqueue_job(job)
+
+        titles = lambda rows: [row["title"] for row in rows]
+        self.assertEqual(titles(self.store.public_jobs()), ["B", "A", "C", "D"])
+        date_asc = titles(self.store.public_jobs(primary_sort="date_asc", secondary_sort=None))
+        self.assertEqual(date_asc[:2], ["D", "C"])
+        self.assertEqual(set(date_asc[2:]), {"A", "B"})
+        self.assertEqual(date_asc, titles(self.store.public_jobs(primary_sort="date_asc", secondary_sort=None)))
+        self.assertEqual(titles(self.store.public_jobs(primary_sort="score_desc", secondary_sort=None)), ["C", "B", "A", "D"])
+        self.assertEqual(titles(self.store.public_jobs(primary_sort="score_asc", secondary_sort=None)), ["A", "B", "C", "D"])
+        self.assertEqual(titles(self.store.public_jobs(primary_sort="score_desc", secondary_sort="date_desc")), ["C", "B", "A", "D"])
+        self.assertEqual(titles(self.store.public_jobs(primary_sort="date_asc", secondary_sort="score_asc")), ["D", "C", "A", "B"])
+        self.assertEqual(
+            titles(self.store.public_jobs("active", 7, "score_asc", "date_desc")),
+            ["B", "C"],
+        )
+        self.assertEqual(
+            titles(self.store.public_jobs(primary_sort="date_desc", secondary_sort="date_asc")),
+            titles(self.store.public_jobs(primary_sort="date_desc", secondary_sort=None)),
+        )
+
+    def test_public_jobs_reject_unknown_sort_modes(self):
+        self.store.enqueue_job(self.job())
+        with self.assertRaisesRegex(ValueError, "sort mode"):
+            self.store.public_jobs(primary_sort="DROP TABLE jobs")
+
 
 class CloudPayloadTests(unittest.TestCase):
     def test_server_derives_redaction_and_rejects_mismatched_id(self):
@@ -231,9 +274,10 @@ class WebPrivacyTests(unittest.TestCase):
     def request(self, path, method="GET", data=None, cookie=""):
         body = urlencode(data or {}).encode()
         captured = {}
+        path_info, _, query_string = path.partition("?")
         environ = {
-            "PATH_INFO": path,
-            "QUERY_STRING": "",
+            "PATH_INFO": path_info,
+            "QUERY_STRING": query_string,
             "REQUEST_METHOD": method,
             "CONTENT_LENGTH": str(len(body)),
             "wsgi.input": io.BytesIO(body),
@@ -266,9 +310,14 @@ class WebPrivacyTests(unittest.TestCase):
         self.assertIn("ChatGPT/Codex Cowork", faq)
         self.assertIn("Frequently asked questions", faq)
         self.assertIn("<details>", faq)
-        self.assertIn("Jobs in last 14 days — 3-month trend", home)
+        self.assertIn("3 Month Job Trend", home)
+        self.assertNotIn("Jobs in last 14 days — 3-month trend", home)
         self.assertIn("Trend history starts today", home)
         self.assertIn('role="img"', home)
+        self.assertIn("LM Studio", faq)
+        self.assertIn("Supabase", faq)
+        self.assertIn("not necessarily confirmed closed", faq)
+        self.assertIn("does not predict", faq)
         self.assertNotIn("rkrishnakumar097@gmail.com", home + faq)
         self.assertNotIn("Private dashboard", faq)
 
@@ -287,6 +336,14 @@ class WebPrivacyTests(unittest.TestCase):
         self.assertEqual(captured["status"], "200 OK")
         self.assertIn(("Content-Type", "image/jpeg"), captured["headers"])
         self.assertTrue(body.startswith(b"\xff\xd8\xff"))
+
+    def test_public_sort_controls_preserve_combined_selection(self):
+        _, page = self.request("/?view=active&score=7&sort=date_asc&then=score_desc")
+        self.assertIn('<option value="date_asc" selected>Oldest published</option>', page)
+        self.assertIn('<option value="score_desc" selected>Highest score</option>', page)
+        self.assertIn('name="view"', page)
+        self.assertIn('name="score"', page)
+        self.assertLess(page.index("Sort first"), page.index("Then by"))
 
     def test_admin_requires_authentication_and_returns_full_letter_after_login(self):
         captured, anonymous = self.request("/admin")

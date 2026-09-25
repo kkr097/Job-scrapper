@@ -39,6 +39,12 @@ TREND_WINDOW_DAYS = 90
 TREND_RETENTION_DAYS = 100
 MAX_ATTEMPTS = 5
 DEFAULT_DB = "cover_letters.db"
+PUBLIC_SORT_MODES = {
+    "date_desc": ("date", "DESC"),
+    "date_asc": ("date", "ASC"),
+    "score_desc": ("score", "DESC"),
+    "score_asc": ("score", "ASC"),
+}
 
 
 def utc_now() -> datetime:
@@ -81,6 +87,30 @@ def prepare_trend_snapshot(raw: dict[str, Any]) -> dict[str, Any]:
         "active_14d_count": count,
         "recorded_at": recorded_at,
     }
+
+
+def public_sort_order(primary_sort: str = "date_desc", secondary_sort: str | None = "score_desc") -> str:
+    """Build a portable, allowlisted ORDER BY expression for public jobs."""
+    if primary_sort not in PUBLIC_SORT_MODES:
+        raise ValueError("invalid public job sort mode")
+    if secondary_sort is not None and secondary_sort not in PUBLIC_SORT_MODES:
+        raise ValueError("invalid public job sort mode")
+
+    clauses: list[str] = []
+    used_fields: set[str] = set()
+    for mode in (primary_sort, secondary_sort):
+        if mode is None:
+            continue
+        field, direction = PUBLIC_SORT_MODES[mode]
+        if field in used_fields:
+            continue
+        used_fields.add(field)
+        if field == "date":
+            clauses.append(f"COALESCE(j.posted_at,j.first_seen) {direction}")
+        else:
+            clauses.extend(("CASE WHEN j.score IS NULL THEN 1 ELSE 0 END ASC", f"j.score {direction}"))
+    clauses.append("j.job_id ASC")
+    return ", ".join(clauses)
 
 
 def normalize_url(url: str) -> str:
@@ -456,8 +486,15 @@ class CoverLetterStore:
                 (job_id, int(applied), now if applied else None, notes[:4000], now),
             )
 
-    def public_jobs(self, view: str = "all", min_score: float | None = None) -> list[dict[str, Any]]:
+    def public_jobs(
+        self,
+        view: str = "all",
+        min_score: float | None = None,
+        primary_sort: str = "date_desc",
+        secondary_sort: str | None = "score_desc",
+    ) -> list[dict[str, Any]]:
         now = utc_now()
+        order_by = public_sort_order(primary_sort, secondary_sort)
         cutoff = iso_utc(now - timedelta(days=PUBLIC_RETENTION_DAYS))
         active_cutoff = iso_utc(now - timedelta(days=ACTIVE_DAYS))
         conditions = ["COALESCE(j.posted_at,j.first_seen) >= ?"]
@@ -479,7 +516,7 @@ class CoverLetterStore:
                        CASE WHEN COALESCE(j.posted_at,j.first_seen) >= ? THEN 'active' ELSE 'expired' END AS age_status
                 FROM jobs j JOIN cover_letters c USING(job_id)
                 WHERE {' AND '.join(conditions)}
-                ORDER BY COALESCE(j.posted_at,j.first_seen) DESC, j.score DESC
+                ORDER BY {order_by}
                 """,
                 (active_cutoff, *params),
             ).fetchall()
