@@ -7,7 +7,7 @@ from unittest.mock import patch
 try:
     import requests  # noqa: F401
 except ModuleNotFoundError:
-    sys.modules["requests"] = types.SimpleNamespace()
+    sys.modules["requests"] = types.SimpleNamespace(get=None, post=None)
 
 from rater import JobRater
 

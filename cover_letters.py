@@ -928,8 +928,8 @@ def main() -> int:
     release = sub.add_parser("release-run")
     release.add_argument("--owner", required=True)
     cloud = sub.add_parser("sync-cloud")
-    cloud.add_argument("--url", default=os.getenv("COVER_LETTER_SYNC_URL", ""))
-    cloud.add_argument("--token", default=os.getenv("COVER_LETTER_SYNC_TOKEN", ""))
+    cloud.add_argument("--url", default=None)
+    cloud.add_argument("--token", default=None)
     sub.add_parser("prune")
     args = parser.parse_args()
     from profile_workspace import ProfileWorkspace
@@ -991,7 +991,10 @@ def main() -> int:
     elif args.command == "release-run":
         print(json.dumps({"released": store.release_run_lease(args.owner)}))
     elif args.command == "sync-cloud":
-        print(json.dumps(store.sync_cloud(args.url, args.token)))
+        print(json.dumps(store.sync_cloud(
+            args.url or os.getenv("COVER_LETTER_SYNC_URL", ""),
+            args.token or os.getenv("COVER_LETTER_SYNC_TOKEN", ""),
+        )))
     elif args.command == "prune":
         print(json.dumps({"deleted": store.prune()}))
     return 0
