@@ -32,12 +32,18 @@ except ImportError:
 
 EVIDENCE_VERSION = "2026-09-25.1"
 PROMPT_VERSION = "2026-09-25.1"
+PROFILE_VERSIONS = {
+    "kk": (EVIDENCE_VERSION, PROMPT_VERSION),
+    "sandra": ("sandra-resume-2026-09-26.1", "sandra-cover-letter-2026-09-26.1"),
+}
 MIN_DESCRIPTION_CHARS = 300
 PUBLIC_RETENTION_DAYS = 28
 ACTIVE_DAYS = 14
 TREND_WINDOW_DAYS = 90
 TREND_RETENTION_DAYS = 100
 MAX_ATTEMPTS = 5
+DEFAULT_RUN_LEASE_MINUTES = 90
+RUN_LEASE_NAME = "cover-letter-generation"
 DEFAULT_DB = "cover_letters.db"
 PUBLIC_SORT_MODES = {
     "date_desc": ("date", "DESC"),
@@ -128,8 +134,13 @@ def normalize_url(url: str) -> str:
     return urlunsplit((parts.scheme.lower(), host, path, urlencode(sorted(query)), ""))
 
 
-def job_id_for_url(url: str) -> str:
-    return hashlib.sha256(normalize_url(url).encode("utf-8")).hexdigest()[:24]
+def job_id_for_url(url: str, profile_id: str = "kk") -> str:
+    normalized = normalize_url(url)
+    profile = (profile_id or "").strip().lower()
+    if profile not in {"kk", "sandra"}:
+        raise ValueError(f"unsupported profile: {profile_id!r}")
+    identity = normalized if profile == "kk" else f"{profile}\n{normalized}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 def description_hash(description: str) -> str:
@@ -178,12 +189,22 @@ def validate_cover_letter(text: str) -> dict[str, int]:
     return {"words": len(words), "body_paragraphs": len(paragraphs)}
 
 
-def make_public_sample(full_text: str) -> str:
+SANDRA_PRIVATE_MOTIVATION_RE = re.compile(
+    r"\b(?:husband|spouse|married|family|relocat(?:e|ion|ing)|visa|work authorization)\b",
+    re.IGNORECASE,
+)
+
+
+def make_public_sample(full_text: str, profile_id: str = "kk") -> str:
     """Return body-only public text, or fail closed if safe bounds are unclear."""
     cleaned = (full_text or "").replace("\r\n", "\n").strip()
     lines = cleaned.splitlines()
     start, end = _body_bounds(lines)
-    body_lines = lines[start:end]
+    body = "\n".join(lines[start:end])
+    paragraphs = re.split(r"\n\s*\n", body)
+    if profile_id == "sandra":
+        paragraphs = [p for p in paragraphs if not SANDRA_PRIVATE_MOTIVATION_RE.search(p)]
+    body_lines = "\n\n".join(paragraphs).splitlines()
     public_lines: list[str] = []
     for line in body_lines:
         if EMAIL_RE.search(line) or PHONE_RE.search(line) or ADDRESS_RE.search(line):
@@ -196,8 +217,12 @@ def make_public_sample(full_text: str) -> str:
 
 
 class CoverLetterStore:
-    def __init__(self, path: str | os.PathLike[str] = DEFAULT_DB):
+    def __init__(self, path: str | os.PathLike[str] = DEFAULT_DB, profile_id: str = "kk"):
         self.path = str(path)
+        self.profile_id = (profile_id or "").strip().lower()
+        if self.profile_id not in {"kk", "sandra"}:
+            raise ValueError(f"unsupported profile: {profile_id!r}")
+        self.evidence_version, self.prompt_version = PROFILE_VERSIONS[self.profile_id]
         self._initialize()
 
     @contextmanager
@@ -231,7 +256,8 @@ class CoverLetterStore:
                     description_hash TEXT NOT NULL,
                     posted_at TEXT,
                     first_seen TEXT NOT NULL,
-                    last_seen TEXT NOT NULL
+                    last_seen TEXT NOT NULL,
+                    auto_letter_eligible INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS cover_letters (
@@ -264,6 +290,13 @@ class CoverLetterStore:
                     recorded_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS automation_leases (
+                    name TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    lease_until TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_jobs_first_seen ON jobs(first_seen);
                 CREATE INDEX IF NOT EXISTS idx_letters_status ON cover_letters(status, lease_until);
                 """
@@ -271,12 +304,89 @@ class CoverLetterStore:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(cover_letters)")}
             if "regeneration_requested_at" not in columns:
                 conn.execute("ALTER TABLE cover_letters ADD COLUMN regeneration_requested_at TEXT")
+            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+            if "auto_letter_eligible" not in job_columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN auto_letter_eligible INTEGER NOT NULL DEFAULT 1")
+
+    def acquire_run_lease(
+        self,
+        owner: str,
+        lease_minutes: int = DEFAULT_RUN_LEASE_MINUTES,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically claim the single cover-letter generator lease."""
+        owner = (owner or "").strip()
+        if not owner:
+            raise ValueError("lease owner is required")
+        if lease_minutes < 1:
+            raise ValueError("lease duration must be positive")
+        now = now or utc_now()
+        now_iso = iso_utc(now)
+        lease_until = iso_utc(now + timedelta(minutes=lease_minutes))
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT owner,lease_until FROM automation_leases WHERE name=?", (RUN_LEASE_NAME,)
+            ).fetchone()
+            if existing and existing["owner"] != owner and existing["lease_until"] > now_iso:
+                return False
+            conn.execute(
+                """
+                INSERT INTO automation_leases(name,owner,lease_until,updated_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,
+                    lease_until=excluded.lease_until,updated_at=excluded.updated_at
+                """,
+                (RUN_LEASE_NAME, owner, lease_until, now_iso),
+            )
+        return True
+
+    def renew_run_lease(
+        self,
+        owner: str,
+        lease_minutes: int = DEFAULT_RUN_LEASE_MINUTES,
+        now: datetime | None = None,
+    ) -> bool:
+        """Extend a live lease only when it is still owned by this run."""
+        owner = (owner or "").strip()
+        if not owner:
+            raise ValueError("lease owner is required")
+        if lease_minutes < 1:
+            raise ValueError("lease duration must be positive")
+        now = now or utc_now()
+        changed = 0
+        with self.connection() as conn:
+            changed = conn.execute(
+                """
+                UPDATE automation_leases SET lease_until=?,updated_at=?
+                WHERE name=? AND owner=? AND lease_until > ?
+                """,
+                (
+                    iso_utc(now + timedelta(minutes=lease_minutes)),
+                    iso_utc(now),
+                    RUN_LEASE_NAME,
+                    owner,
+                    iso_utc(now),
+                ),
+            ).rowcount
+        return changed == 1
+
+    def release_run_lease(self, owner: str) -> bool:
+        """Release the generator lease without allowing another run to be removed."""
+        owner = (owner or "").strip()
+        if not owner:
+            raise ValueError("lease owner is required")
+        with self.connection() as conn:
+            changed = conn.execute(
+                "DELETE FROM automation_leases WHERE name=? AND owner=?", (RUN_LEASE_NAME, owner)
+            ).rowcount
+        return changed == 1
 
     def enqueue_job(self, job: dict[str, Any]) -> str | None:
         url = normalize_url(str(job.get("url") or job.get("URL") or ""))
         if not url:
             return None
-        job_id = job_id_for_url(url)
+        job_id = job_id_for_url(url, self.profile_id)
         description = str(job.get("description") or job.get("Description") or "").strip()
         desc_hash = description_hash(description)
         now = utc_now()
@@ -298,8 +408,8 @@ class CoverLetterStore:
             conn.execute(
                 """
                 INSERT INTO jobs(job_id,url,title,company,location,source,score,description,
-                                 description_hash,posted_at,first_seen,last_seen)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                                 description_hash,posted_at,first_seen,last_seen,auto_letter_eligible)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     title=excluded.title, company=excluded.company, location=excluded.location,
                     source=excluded.source, score=excluded.score, description=excluded.description,
@@ -319,6 +429,7 @@ class CoverLetterStore:
                     posted_at,
                     iso_utc(first_seen),
                     iso_utc(now),
+                    int(bool(job.get("auto_letter_eligible", True))),
                 ),
             )
             reset = existing is None or existing["description_hash"] != desc_hash
@@ -335,7 +446,7 @@ class CoverLetterStore:
                         generated_at=NULL, lease_until=NULL, regeneration_requested_at=NULL,
                         attempts=0, error=excluded.error
                     """,
-                    (job_id, desc_hash, EVIDENCE_VERSION, PROMPT_VERSION, status, error),
+                    (job_id, desc_hash, self.evidence_version, self.prompt_version, status, error),
                 )
             else:
                 conn.execute(
@@ -372,44 +483,70 @@ class CoverLetterStore:
                     WHERE job_id=?
                     """,
                     (
-                        EVIDENCE_VERSION, PROMPT_VERSION, status,
-                        EVIDENCE_VERSION, PROMPT_VERSION,
-                        EVIDENCE_VERSION, PROMPT_VERSION,
-                        EVIDENCE_VERSION, PROMPT_VERSION,
-                        EVIDENCE_VERSION, PROMPT_VERSION,
-                        EVIDENCE_VERSION, PROMPT_VERSION,
-                        EVIDENCE_VERSION, PROMPT_VERSION,
-                        EVIDENCE_VERSION, PROMPT_VERSION,
-                        EVIDENCE_VERSION, PROMPT_VERSION, error,
-                        EVIDENCE_VERSION, PROMPT_VERSION, job_id,
+                        self.evidence_version, self.prompt_version, status,
+                        self.evidence_version, self.prompt_version,
+                        self.evidence_version, self.prompt_version,
+                        self.evidence_version, self.prompt_version,
+                        self.evidence_version, self.prompt_version,
+                        self.evidence_version, self.prompt_version,
+                        self.evidence_version, self.prompt_version,
+                        self.evidence_version, self.prompt_version,
+                        self.evidence_version, self.prompt_version, error,
+                        self.evidence_version, self.prompt_version, job_id,
                     ),
                 )
         return job_id
 
-    def sync_csv(self, csv_path: str | os.PathLike[str]) -> int:
+    def sync_csv(
+        self,
+        csv_path: str | os.PathLike[str],
+        *,
+        auto_letter_eligible: bool = True,
+        first_seen: str | None = None,
+    ) -> int:
         count = 0
         with open(csv_path, newline="", encoding="utf-8-sig") as stream:
             for row in csv.DictReader(stream):
+                row["auto_letter_eligible"] = auto_letter_eligible
+                if first_seen:
+                    row["first_seen"] = first_seen
                 if self.enqueue_job(row):
                     count += 1
         return count
 
-    def claim_batch(self, limit: int = 10, lease_minutes: int = 90) -> list[dict[str, Any]]:
+    def claim_batch(
+        self,
+        limit: int = 10,
+        lease_minutes: int = 90,
+        min_score: float | None = None,
+        eligible_only: bool = False,
+        daily_limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if daily_limit is not None:
+            remaining = max(0, daily_limit - self.generated_today())
+            if remaining == 0:
+                return []
+            limit = min(limit, remaining)
         now = utc_now()
         lease_until = iso_utc(now + timedelta(minutes=lease_minutes))
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            filters = ["c.attempts < ?", "(c.status='queued' OR (c.status='generating' AND c.lease_until < ?))"]
+            params: list[Any] = [MAX_ATTEMPTS, iso_utc(now)]
+            if min_score is not None:
+                filters.append("j.score >= ?")
+                params.append(min_score)
+            if eligible_only:
+                filters.append("j.auto_letter_eligible=1")
             rows = conn.execute(
-                """
+                f"""
                 SELECT j.*, c.attempts
                 FROM jobs j JOIN cover_letters c USING(job_id)
-                WHERE c.attempts < ? AND (
-                    c.status='queued' OR (c.status='generating' AND c.lease_until < ?)
-                )
-                ORDER BY j.first_seen, j.job_id
+                WHERE {' AND '.join(filters)}
+                ORDER BY j.score DESC, j.first_seen DESC, j.job_id
                 LIMIT ?
                 """,
-                (MAX_ATTEMPTS, iso_utc(now), max(1, limit)),
+                (*params, max(1, limit)),
             ).fetchall()
             ids = [row["job_id"] for row in rows]
             if ids:
@@ -420,12 +557,24 @@ class CoverLetterStore:
                 )
             return [dict(row) for row in rows]
 
+    def generated_today(self) -> int:
+        local_timezone = datetime.now().astimezone().tzinfo
+        local_date = utc_now().astimezone(local_timezone).date()
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT generated_at FROM cover_letters WHERE status='ready' AND generated_at IS NOT NULL"
+            ).fetchall()
+        return sum(
+            parse_datetime(row["generated_at"]).astimezone(local_timezone).date() == local_date
+            for row in rows
+        )
+
     def commit_result(self, job_id: str, full_text: str, language: str) -> dict[str, int]:
         language = (language or "").lower()
         if language not in {"de", "en"}:
             raise ValueError("language must be 'de' or 'en'")
         metrics = validate_cover_letter(full_text)
-        public_text = make_public_sample(full_text)
+        public_text = make_public_sample(full_text, self.profile_id)
         with self.connection() as conn:
             changed = conn.execute(
                 """
@@ -520,7 +669,7 @@ class CoverLetterStore:
                 """,
                 (active_cutoff, *params),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [{**dict(row), "profile_id": self.profile_id} for row in rows]
 
     def admin_jobs(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -533,7 +682,7 @@ class CoverLetterStore:
                 ORDER BY j.first_seen DESC
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [{**dict(row), "profile_id": self.profile_id} for row in rows]
 
     def sync_records(self) -> list[dict[str, Any]]:
         """Return recent jobs plus applied history for authenticated cloud sync."""
@@ -550,7 +699,7 @@ class CoverLetterStore:
                 """,
                 (cutoff,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [{**dict(row), "profile_id": self.profile_id} for row in rows]
 
     def record_trend_snapshot(self, snapshot_date: str | None = None, count: int | None = None) -> dict[str, Any]:
         point = prepare_trend_snapshot({
@@ -666,7 +815,7 @@ class CoverLetterStore:
         """Accept authenticated sync payloads for local deployment/testing."""
         from cloud_store import prepare_sync_record
 
-        prepared = [prepare_sync_record(record) for record in records]
+        prepared = [prepare_sync_record(record, self.profile_id) for record in records]
         for item in prepared:
             self.enqueue_job(item)
             with self.connection() as conn:
@@ -697,15 +846,22 @@ class CoverLetterStore:
             raise ValueError("cloud sync requires HTTPS")
         if not token:
             raise ValueError("COVER_LETTER_SYNC_TOKEN is required")
-        headers = {"Authorization": f"Bearer {token}", "User-Agent": "kk-jobs-sync/1"}
-        state_response = requests.get(f"{base_url}/api/v1/state", headers=headers, timeout=30)
+        headers = {"Authorization": f"Bearer {token}", "User-Agent": "matchatlas-sync/2"}
+        profile_base = f"{base_url}/api/v1/profiles/{self.profile_id}"
+        state_response = requests.get(f"{profile_base}/state", headers=headers, timeout=30)
+        if state_response.status_code == 404 and self.profile_id == "kk":
+            # Keep KK synchronization compatible while the deployed service is
+            # still on the pre-profile API. Never fall back for other profiles,
+            # because the legacy routes are KK-only.
+            profile_base = f"{base_url}/api/v1"
+            state_response = requests.get(f"{profile_base}/state", headers=headers, timeout=30)
         state_response.raise_for_status()
         pulled = self.import_cloud_state(state_response.json())
         self.record_trend_snapshot()
         records = self.sync_records()
         snapshots = self.trend_snapshots(TREND_RETENTION_DAYS)
         push_response = requests.post(
-            f"{base_url}/api/v1/sync",
+            f"{profile_base}/sync",
             headers={**headers, "Content-Type": "application/json"},
             json={"jobs": records, "trend_snapshots": snapshots},
             timeout=60,
@@ -749,28 +905,66 @@ def _load_results(path: str) -> Iterable[dict[str, Any]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manage the cover-letter generation queue")
-    parser.add_argument("--db", default=os.getenv("COVER_LETTER_DB", DEFAULT_DB))
+    parser.add_argument("--profile", required=True, choices=("kk", "sandra"))
+    parser.add_argument("--db", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     sync = sub.add_parser("sync-csv")
-    sync.add_argument("--csv", default="daily_jobs.csv")
+    sync.add_argument("--csv", default=None)
+    sync.add_argument("--legacy", action="store_true")
+    sync.add_argument("--first-seen", default=None)
     prepare = sub.add_parser("prepare-batch")
     prepare.add_argument("--limit", type=int, default=10)
     prepare.add_argument("--output", default="cover_letter_batch.json")
+    prepare.add_argument("--min-score", type=float, default=None)
+    prepare.add_argument("--eligible-only", action="store_true")
     commit = sub.add_parser("commit-batch")
     commit.add_argument("--input", default="cover_letter_results.json")
+    acquire = sub.add_parser("acquire-run")
+    acquire.add_argument("--owner", required=True)
+    acquire.add_argument("--lease-minutes", type=int, default=DEFAULT_RUN_LEASE_MINUTES)
+    renew = sub.add_parser("renew-run")
+    renew.add_argument("--owner", required=True)
+    renew.add_argument("--lease-minutes", type=int, default=DEFAULT_RUN_LEASE_MINUTES)
+    release = sub.add_parser("release-run")
+    release.add_argument("--owner", required=True)
     cloud = sub.add_parser("sync-cloud")
     cloud.add_argument("--url", default=os.getenv("COVER_LETTER_SYNC_URL", ""))
     cloud.add_argument("--token", default=os.getenv("COVER_LETTER_SYNC_TOKEN", ""))
     sub.add_parser("prune")
     args = parser.parse_args()
-    store = CoverLetterStore(args.db)
+    from profile_workspace import ProfileWorkspace
+
+    workspace = ProfileWorkspace.load(args.profile)
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(workspace.private_path(".env"), override=True)
+    except ImportError:
+        pass
+    db_path = args.db or str(workspace.output_path("cover_letters.db"))
+    store = CoverLetterStore(db_path, args.profile)
 
     if args.command == "sync-csv":
-        print(json.dumps({"enqueued": store.sync_csv(args.csv)}))
+        csv_path = args.csv or str(workspace.output_path("daily_jobs.csv"))
+        print(json.dumps({"enqueued": store.sync_csv(
+            csv_path,
+            auto_letter_eligible=not args.legacy,
+            first_seen=args.first_seen,
+        )}))
     elif args.command == "prepare-batch":
-        batch = store.claim_batch(args.limit)
-        _write_json(args.output, batch)
-        print(json.dumps({"claimed": len(batch), "output": args.output}))
+        limit = min(args.limit, 10) if args.profile == "sandra" else args.limit
+        min_score = 8 if args.profile == "sandra" and args.min_score is None else args.min_score
+        eligible_only = args.eligible_only or args.profile == "sandra"
+        batch = store.claim_batch(
+            limit,
+            min_score=min_score,
+            eligible_only=eligible_only,
+            daily_limit=10 if args.profile == "sandra" else None,
+        )
+        output = args.output
+        if not os.path.isabs(output):
+            output = str(workspace.output_path(output))
+        _write_json(output, batch)
+        print(json.dumps({"claimed": len(batch), "output": output}))
     elif args.command == "commit-batch":
         committed = unavailable = failed = 0
         for item in _load_results(args.input):
@@ -786,6 +980,16 @@ def main() -> int:
                 store.release_with_error(job_id, str(exc))
                 failed += 1
         print(json.dumps({"committed": committed, "unavailable": unavailable, "failed": failed}))
+    elif args.command == "acquire-run":
+        acquired = store.acquire_run_lease(args.owner, args.lease_minutes)
+        print(json.dumps({"acquired": acquired}))
+        return 0 if acquired else 75
+    elif args.command == "renew-run":
+        renewed = store.renew_run_lease(args.owner, args.lease_minutes)
+        print(json.dumps({"renewed": renewed}))
+        return 0 if renewed else 75
+    elif args.command == "release-run":
+        print(json.dumps({"released": store.release_run_lease(args.owner)}))
     elif args.command == "sync-cloud":
         print(json.dumps(store.sync_cloud(args.url, args.token)))
     elif args.command == "prune":

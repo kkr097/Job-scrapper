@@ -18,3 +18,5 @@ services:
         generateValue: true
       - key: COVER_LETTER_SYNC_TOKEN
         sync: false
+      - key: COVER_LETTER_SYNC_TOKEN_SANDRA
+        sync: false

@@ -1,0 +1,24 @@
+{
+  "profile_id": "sandra",
+  "display_name": "Sandra",
+  "min_score": 6,
+  "rating_preferred": "lmstudio",
+  "lmstudio_enabled": true,
+  "lmstudio_api_base": "http://127.0.0.1:1234/v1",
+  "exclude_mandatory_german": true,
+  "llm_language_gate_enabled": true,
+  "reject_any_mandatory_german": true,
+  "candidate_german_level": "A2",
+  "sources": {"linkedin": true, "xing": false, "company_careers": false},
+  "linkedin_search_urls": [
+    "https://de.linkedin.com/jobs/search?keywords=AI%20Engineer&location=Deutschland&f_TPR=r86400",
+    "https://de.linkedin.com/jobs/search?keywords=ML%20Engineer&location=Deutschland&f_TPR=r86400",
+    "https://de.linkedin.com/jobs/search?keywords=Python%20Developer&location=Deutschland&f_TPR=r86400"
+  ],
+  "xing_search_urls": [],
+  "score_pending_file": "score_pending_jobs.csv",
+  "output": {"excel_file": "daily_jobs.csv"},
+  "output_nonmatch_file": "daily_jobs_nonmatch.csv",
+  "cache_file": "seen_jobs_cache.json",
+  "cover_letter_db": "cover_letters.db"
+}

@@ -12,6 +12,8 @@ daily_jobs.xlsx
 
 # Config with API keys (keep private!)
 config.json
+candidate_profile.json
+seen_jobs_cache.json
 
 # IDE
 .vscode/
@@ -31,5 +33,13 @@ cover_letter_results.json
 tests/.tmp/
 tests/.deps/
 /**/*.log
+/**/*.lock
 /**/*.ps1
 /**/*.csv
+/profiles/*/private/
+/profiles/*/state/
+/migration-backup-*/
+/rescore-backup-*/
+/.git - Copy/
+/* - Copy.*
+/retry_batch.json

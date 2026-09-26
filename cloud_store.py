@@ -29,12 +29,18 @@ from cover_letters import (
 VALID_STATUSES = {"queued", "generating", "ready", "unavailable"}
 
 
-def prepare_sync_record(raw: dict[str, Any]) -> dict[str, Any]:
+def prepare_sync_record(raw: dict[str, Any], profile_id: str = "kk") -> dict[str, Any]:
     """Validate a local record and derive every public field server-side."""
+    profile_id = (profile_id or "").strip().lower()
+    if profile_id not in {"kk", "sandra"}:
+        raise ValueError("unsupported profile")
+    supplied_profile = str(raw.get("profile_id") or profile_id).strip().lower()
+    if supplied_profile != profile_id:
+        raise ValueError("record profile does not match authenticated profile")
     url = normalize_url(str(raw.get("url") or ""))
     if not url:
         raise ValueError("job URL is required")
-    job_id = job_id_for_url(url)
+    job_id = job_id_for_url(url, profile_id)
     supplied_id = str(raw.get("job_id") or "")
     if supplied_id and supplied_id != job_id:
         raise ValueError("job ID does not match URL")
@@ -53,7 +59,7 @@ def prepare_sync_record(raw: dict[str, Any]) -> dict[str, Any]:
         if not full_text:
             raise ValueError("ready cover letter requires full text")
         validate_cover_letter(full_text)
-        public_text = make_public_sample(full_text)
+        public_text = make_public_sample(full_text, profile_id)
     else:
         full_text = None
         language = None
@@ -69,6 +75,7 @@ def prepare_sync_record(raw: dict[str, Any]) -> dict[str, Any]:
     posted_raw = str(raw.get("posted_at") or "").strip()
     generated_raw = str(raw.get("generated_at") or "").strip()
     return {
+        "profile_id": profile_id,
         "job_id": job_id,
         "url": url,
         "title": str(raw.get("title") or "Untitled job")[:500],
@@ -96,10 +103,13 @@ def prepare_sync_record(raw: dict[str, Any]) -> dict[str, Any]:
 class PostgresCoverLetterStore:
     """Cloud store with the same website-facing contract as CoverLetterStore."""
 
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, profile_id: str = "kk"):
         if not dsn:
             raise ValueError("DATABASE_URL is required")
         self.dsn = dsn
+        self.profile_id = (profile_id or "").strip().lower()
+        if self.profile_id not in {"kk", "sandra"}:
+            raise ValueError("unsupported profile")
         self._initialize()
 
     @contextmanager
@@ -121,8 +131,26 @@ class PostgresCoverLetterStore:
         with self.connection() as conn:
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    public_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    sort_order INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO profiles(profile_id,display_name,public_enabled,sort_order)
+                VALUES ('kk','KK',TRUE,1),('sandra','Sandra',TRUE,2)
+                ON CONFLICT(profile_id) DO NOTHING
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL DEFAULT 'kk' REFERENCES profiles(profile_id),
                     url TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL,
                     company TEXT NOT NULL DEFAULT '',
@@ -137,6 +165,9 @@ class PostgresCoverLetterStore:
                 )
                 """
             )
+            conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT 'kk'")
+            conn.execute("ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_url_key")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cloud_jobs_profile_url ON jobs(profile_id,url)")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cover_letters (
@@ -172,23 +203,40 @@ class PostgresCoverLetterStore:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS trend_snapshots (
-                    snapshot_date TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL DEFAULT 'kk' REFERENCES profiles(profile_id),
+                    snapshot_date TEXT NOT NULL,
                     active_14d_count INTEGER NOT NULL CHECK(active_14d_count >= 0),
-                    recorded_at TEXT NOT NULL
+                    recorded_at TEXT NOT NULL,
+                    PRIMARY KEY(profile_id,snapshot_date)
                 )
                 """
             )
+            conn.execute("ALTER TABLE trend_snapshots ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT 'kk'")
+            conn.execute(
+                """
+                DO $$ BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conrelid='trend_snapshots'::regclass AND contype='p'
+                          AND pg_get_constraintdef(oid) = 'PRIMARY KEY (snapshot_date)'
+                    ) THEN
+                        ALTER TABLE trend_snapshots DROP CONSTRAINT trend_snapshots_pkey;
+                    END IF;
+                END $$
+                """
+            )
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trend_profile_date ON trend_snapshots(profile_id,snapshot_date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cloud_jobs_first_seen ON jobs(first_seen)")
 
     def sync_jobs(self, records: Iterable[dict[str, Any]]) -> int:
-        prepared = [prepare_sync_record(record) for record in records]
+        prepared = [prepare_sync_record(record, self.profile_id) for record in records]
         with self.connection() as conn:
             for item in prepared:
                 conn.execute(
                     """
-                    INSERT INTO jobs(job_id,url,title,company,location,source,score,description,
+                    INSERT INTO jobs(job_id,profile_id,url,title,company,location,source,score,description,
                                      description_hash,posted_at,first_seen,last_seen)
-                    VALUES(%(job_id)s,%(url)s,%(title)s,%(company)s,%(location)s,%(source)s,
+                    VALUES(%(job_id)s,%(profile_id)s,%(url)s,%(title)s,%(company)s,%(location)s,%(source)s,
                            %(score)s,%(description)s,%(description_hash)s,%(posted_at)s,
                            %(first_seen)s,%(last_seen)s)
                     ON CONFLICT(job_id) DO UPDATE SET
@@ -236,8 +284,8 @@ class PostgresCoverLetterStore:
         order_by = public_sort_order(primary_sort, secondary_sort)
         cutoff = iso_utc(utc_now() - timedelta(days=PUBLIC_RETENTION_DAYS))
         active_cutoff = iso_utc(utc_now() - timedelta(days=ACTIVE_DAYS))
-        conditions = ["COALESCE(j.posted_at,j.first_seen) >= %s"]
-        params: list[Any] = [cutoff]
+        conditions = ["j.profile_id = %s", "COALESCE(j.posted_at,j.first_seen) >= %s"]
+        params: list[Any] = [self.profile_id, cutoff]
         if view == "active":
             conditions.append("COALESCE(j.posted_at,j.first_seen) >= %s")
             params.append(active_cutoff)
@@ -269,8 +317,10 @@ class PostgresCoverLetterStore:
                        COALESCE(a.applied,0) AS applied,a.applied_at,a.notes
                 FROM jobs j JOIN cover_letters c USING(job_id)
                 LEFT JOIN applications a USING(job_id)
+                WHERE j.profile_id=%s
                 ORDER BY j.first_seen DESC
-                """
+                """,
+                (self.profile_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -290,15 +340,15 @@ class PostgresCoverLetterStore:
             for point in prepared:
                 conn.execute(
                     """
-                    INSERT INTO trend_snapshots(snapshot_date,active_14d_count,recorded_at)
-                    VALUES(%s,%s,%s)
-                    ON CONFLICT(snapshot_date) DO UPDATE SET
+                    INSERT INTO trend_snapshots(profile_id,snapshot_date,active_14d_count,recorded_at)
+                    VALUES(%s,%s,%s,%s)
+                    ON CONFLICT(profile_id,snapshot_date) DO UPDATE SET
                         active_14d_count=excluded.active_14d_count,
                         recorded_at=excluded.recorded_at
                     """,
-                    (point["snapshot_date"], point["active_14d_count"], point["recorded_at"]),
+                    (self.profile_id, point["snapshot_date"], point["active_14d_count"], point["recorded_at"]),
                 )
-            conn.execute("DELETE FROM trend_snapshots WHERE snapshot_date < %s", (cutoff,))
+            conn.execute("DELETE FROM trend_snapshots WHERE profile_id=%s AND snapshot_date < %s", (self.profile_id, cutoff))
         return len(prepared)
 
     def trend_snapshots(self, days: int = TREND_WINDOW_DAYS) -> list[dict[str, Any]]:
@@ -307,9 +357,9 @@ class PostgresCoverLetterStore:
             rows = conn.execute(
                 """
                 SELECT snapshot_date,active_14d_count,recorded_at
-                FROM trend_snapshots WHERE snapshot_date >= %s ORDER BY snapshot_date
+                FROM trend_snapshots WHERE profile_id=%s AND snapshot_date >= %s ORDER BY snapshot_date
                 """,
-                (cutoff,),
+                (self.profile_id, cutoff),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -348,14 +398,19 @@ class PostgresCoverLetterStore:
     def cloud_state(self) -> dict[str, list[dict[str, Any]]]:
         with self.connection() as conn:
             applications = conn.execute(
-                "SELECT job_id,applied,applied_at,notes,updated_at FROM applications ORDER BY updated_at"
+                """SELECT a.job_id,a.applied,a.applied_at,a.notes,a.updated_at
+                   FROM applications a JOIN jobs j USING(job_id)
+                   WHERE j.profile_id=%s ORDER BY a.updated_at""",
+                (self.profile_id,),
             ).fetchall()
             requests = conn.execute(
                 """
                 SELECT job_id,regeneration_requested_at
-                FROM cover_letters WHERE regeneration_requested_at IS NOT NULL
+                FROM cover_letters c JOIN jobs j USING(job_id)
+                WHERE j.profile_id=%s AND regeneration_requested_at IS NOT NULL
                 ORDER BY regeneration_requested_at
-                """
+                """,
+                (self.profile_id,),
             ).fetchall()
         return {
             "applications": [dict(row) for row in applications],
@@ -370,10 +425,10 @@ class PostgresCoverLetterStore:
             deleted = conn.execute(
                 """
                 DELETE FROM jobs
-                WHERE COALESCE(posted_at,first_seen) < %s
+                WHERE profile_id=%s AND COALESCE(posted_at,first_seen) < %s
                   AND job_id NOT IN (SELECT job_id FROM applications WHERE applied=1)
                 """,
-                (cutoff,),
+                (self.profile_id, cutoff),
             ).rowcount
-            conn.execute("DELETE FROM trend_snapshots WHERE snapshot_date < %s", (trend_cutoff,))
+            conn.execute("DELETE FROM trend_snapshots WHERE profile_id=%s AND snapshot_date < %s", (self.profile_id, trend_cutoff))
             return deleted

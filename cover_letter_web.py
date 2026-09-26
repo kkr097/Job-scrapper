@@ -21,7 +21,8 @@ from wsgiref.simple_server import make_server
 from cover_letters import CoverLetterStore, DEFAULT_DB, PUBLIC_SORT_MODES, prepare_trend_snapshot, utc_now
 
 
-SESSION_COOKIE = "kk_cover_admin"
+SESSION_COOKIE = "matchatlas_admin"
+PROFILES = {"kk": "KK", "sandra": "Sandra"}
 MAX_JSON_BYTES = 5_000_000
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DONATION_QR_PATH = STATIC_DIR / "donation-qr.jpeg"
@@ -45,12 +46,18 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 class CoverLetterWebApp:
-    def __init__(self, store: Any, password_hash: str, secret_key: str, secure_cookie: bool = True, sync_token: str = ""):
-        self.store = store
+    def __init__(self, store: Any, password_hash: str, secret_key: str, secure_cookie: bool = True, sync_token: str | dict[str, str] = ""):
+        self.stores = store if isinstance(store, dict) else {"kk": store}
+        self.store = self.stores.get("kk", next(iter(self.stores.values())))
         self.password_hash = password_hash
         self.secret_key = secret_key.encode("utf-8")
         self.secure_cookie = secure_cookie
-        self.sync_token = sync_token
+        self.sync_tokens = sync_token if isinstance(sync_token, dict) else {"kk": sync_token}
+
+    def _profile_store(self, profile_id: str) -> Any:
+        if profile_id not in PROFILES or profile_id not in self.stores:
+            raise KeyError(profile_id)
+        return self.stores[profile_id]
 
     def _sign(self, payload: str) -> str:
         signature = hmac.new(self.secret_key, payload.encode(), hashlib.sha256).hexdigest()
@@ -78,9 +85,10 @@ class CoverLetterWebApp:
         except (ValueError, UnicodeDecodeError):
             return False
 
-    def _sync_authorized(self, environ: dict) -> bool:
+    def _sync_authorized(self, environ: dict, profile_id: str = "kk") -> bool:
         supplied = environ.get("HTTP_AUTHORIZATION", "")
-        expected = f"Bearer {self.sync_token}" if self.sync_token else ""
+        token = self.sync_tokens.get(profile_id, "")
+        expected = f"Bearer {token}" if token else ""
         return bool(expected) and hmac.compare_digest(supplied, expected)
 
     def _csrf(self, environ: dict) -> str:
@@ -156,15 +164,17 @@ class CoverLetterWebApp:
         return [b""]
 
     @staticmethod
-    def _layout(title: str, content: str, admin: bool = False) -> str:
-        nav = '<a href="/">Jobs</a><a href="/faq">FAQ</a>' + ('<a href="/admin">Private dashboard</a>' if admin else '<a href="/admin">Admin</a>')
+    def _layout(title: str, content: str, admin: bool = False, profile_id: str = "kk") -> str:
+        profile_nav = '<a href="/jobs/kk">KK Jobs</a><a href="/jobs/sandra">Sandra Jobs</a>'
+        admin_href = f"/admin/{profile_id}"
+        nav = profile_nav + '<a href="/faq">FAQ</a>' + (f'<a href="{admin_href}">Private dashboard</a>' if admin else f'<a href="{admin_href}">Admin</a>')
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>
 <style>
 :root{{--ink:#0a0a0a;--paper:#fff;--line:#d9d9d9;--muted:#696969}}*{{box-sizing:border-box}}
 body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 Arial,sans-serif}}header{{display:flex;justify-content:space-between;align-items:center;padding:22px 5vw;border-bottom:1px solid var(--line)}}
 header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px}}a{{color:inherit}}main{{max-width:1180px;margin:auto;padding:44px 5vw}}h1{{font-size:clamp(2.3rem,6vw,5.6rem);line-height:.98;max-width:900px;margin:0 0 38px}}h2{{margin-top:34px}}.meta{{color:var(--muted);font-size:.88rem}}.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:0 0 30px}}.stat{{border:1px solid var(--line);padding:22px}}.stat b{{display:block;font-size:2.5rem}}.support-tile{{width:100%;border:1px solid var(--line);border-radius:0;background:var(--paper);color:var(--ink);padding:22px;text-align:left;cursor:pointer}}.support-tile:hover,.support-tile:focus-visible{{background:#f5f5f5}}.support-tile b{{font-size:1.45rem;line-height:1.2}}.toolbar{{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 28px}}select,input,textarea,button{{font:inherit;padding:10px 12px;border:1px solid var(--ink);background:#fff}}button,.pill{{border-radius:999px;background:#0a0a0a;color:#fff;padding:10px 18px;text-decoration:none;display:inline-block}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:14px 10px;border-bottom:1px solid var(--line);vertical-align:top}}.expired{{color:#777}}pre{{white-space:pre-wrap;font:inherit;border:1px solid var(--line);padding:24px}}.card{{border:1px solid var(--line);padding:24px;margin:18px 0}}.trend-card{{border:1px solid var(--line);padding:22px;margin:0 0 30px}}.trend-card h2{{margin:0 0 4px}}.trend-card svg{{display:block;width:100%;height:auto;margin-top:14px}}dialog{{width:min(92vw,520px);border:1px solid var(--ink);padding:28px;background:var(--paper);color:var(--ink)}}dialog::backdrop{{background:rgba(0,0,0,.65)}}dialog h2{{margin:0 44px 10px 0}}dialog img{{display:block;width:min(100%,320px);height:auto;margin:22px auto 0}}.dialog-close{{float:right;margin:-8px -8px 8px 12px}}.error{{color:#9b1c1c}}textarea{{display:block;width:100%;min-height:70px;margin:10px 0}}@media(max-width:760px){{header{{align-items:flex-start;gap:18px}}nav{{gap:14px;flex-wrap:wrap;justify-content:flex-end}}table,thead,tbody,tr,th,td{{display:block}}thead{{display:none}}td{{padding:5px 0;border:0}}tr{{padding:18px 0;border-bottom:1px solid var(--line)}}dialog{{padding:22px}}}}
-</style></head><body><header><strong>KK JOBS</strong><nav>{nav}</nav></header><main>{content}</main></body></html>"""
+</style></head><body><header><strong>MATCHATLAS</strong><nav>{nav}</nav></header><main>{content}</main></body></html>"""
 
     @staticmethod
     def _trend_chart(points: list[dict[str, Any]]) -> str:
@@ -212,7 +222,8 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
 {grid}{line}{circles}<text x="{left}" y="{height-8}" font-size="12" fill="#696969">{start.strftime('%d %b')}</text><text x="{width-right}" y="{height-8}" text-anchor="end" font-size="12" fill="#696969">{today.strftime('%d %b')}</text></svg>'''
         return f'<section class="trend-card">{heading}{note}{svg}</section>'
 
-    def _public_home(self, environ: dict, start_response: Callable):
+    def _public_home(self, environ: dict, start_response: Callable, profile_id: str = "kk"):
+        store = self._profile_store(profile_id)
         query = dict(urllib.parse.parse_qsl(environ.get("QUERY_STRING", "")))
         view = query.get("view", "all") if query.get("view") in {"all", "active", "expired"} else "all"
         try:
@@ -243,16 +254,16 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             f'<option value="{value}"{" selected" if value == secondary_sort else ""}>{label}</option>'
             for value, label in sort_labels
         )
-        summary_jobs = self.store.public_jobs("all")
-        filtered_jobs = self.store.public_jobs("all", min_score, primary_sort, secondary_sort)
+        summary_jobs = store.public_jobs("all")
+        filtered_jobs = store.public_jobs("all", min_score, primary_sort, secondary_sort)
         jobs = filtered_jobs if view == "all" else [job for job in filtered_jobs if job["age_status"] == view]
         active_count = sum(job["age_status"] == "active" for job in summary_jobs)
         expired_count = sum(job["age_status"] == "expired" for job in summary_jobs)
-        trend = self._trend_chart(self.store.trend_snapshots())
+        trend = self._trend_chart(store.trend_snapshots())
         rows = []
         for job in jobs:
             status_class = "expired" if job["age_status"] == "expired" else ""
-            letter = f'<a href="/jobs/{job["job_id"]}/cover-letter">Cover letter sample</a>' if job["status"] == "ready" and job["public_text"] else '<span class="meta">Cover letter unavailable</span>'
+            letter = f'<a href="/jobs/{profile_id}/{job["job_id"]}/cover-letter">Cover letter sample</a>' if job["status"] == "ready" and job["public_text"] else '<span class="meta">Cover letter unavailable</span>'
             date = str(job.get("posted_at") or job.get("first_seen") or "")[:10]
             rows.append(f'<tr class="{status_class}"><td><a href="{html.escape(job["url"], quote=True)}" rel="noopener noreferrer">{html.escape(job["title"])}</a><div class="meta">{html.escape(job["company"])}</div></td><td>{html.escape(date)}</td><td>{html.escape(job["source"])}</td><td>{html.escape(str(job["score"] or ""))}</td><td>{html.escape(job["age_status"].title())}</td><td>{letter}</td></tr>')
         content = f"""<p class="meta">CURATED JOBS · LAST 28 DAYS</p><h1>Relevant work, without the noise.</h1>
@@ -262,7 +273,7 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
 <table><thead><tr><th>Job</th><th>Date</th><th>Source</th><th>Score</th><th>Status</th><th>Letter</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="6">No jobs match these filters.</td></tr>'}</tbody></table>
 <dialog id="donation-dialog" aria-labelledby="donation-title"><button class="dialog-close" type="button" id="close-donation" aria-label="Close donation popup">Close</button><h2 id="donation-title">Buy me a coffee</h2><p>This website saves time by collecting, filtering, and scoring relevant jobs from LinkedIn, XING, and employer career pages. It provides direct application links and redacted cover-letter examples in one place.</p><p>Support is completely voluntary. If the website helps you, scan the PayPal QR code with your phone to support its running costs and continued improvement.</p><img src="/static/donation-qr.jpeg" alt="PayPal donation QR code for Krishnakumar Radhakrishna Panicker" loading="lazy" width="320" height="360"></dialog>
 <script>(()=>{{const modal=document.getElementById('donation-dialog');const open=document.getElementById('open-donation');const close=document.getElementById('close-donation');open.addEventListener('click',()=>{{modal.showModal();close.focus();}});close.addEventListener('click',()=>modal.close());modal.addEventListener('click',event=>{{const box=modal.getBoundingClientRect();if(event.clientX<box.left||event.clientX>box.right||event.clientY<box.top||event.clientY>box.bottom)modal.close();}});}})();</script>"""
-        return self._response(start_response, self._layout("KK Jobs", content))
+        return self._response(start_response, self._layout(f"{PROFILES[profile_id]} Jobs", content, profile_id=profile_id))
 
     def _faq(self, start_response: Callable):
         content = """<p class="meta">ABOUT THIS PROJECT</p><h1>Frequently asked questions</h1>
@@ -291,32 +302,32 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
 <details><summary>How can I support the project?</summary><p>Support is completely voluntary. The Buy me a coffee tile on the jobs page opens a PayPal QR code for anyone who finds the project useful and wants to support its running costs and continued improvement.</p></details></section>"""
         return self._response(start_response, self._layout("FAQ", content))
 
-    def _public_letter(self, job_id: str, start_response: Callable):
-        job = self.store.get_public_job(job_id)
+    def _public_letter(self, profile_id: str, job_id: str, start_response: Callable):
+        job = self._profile_store(profile_id).get_public_job(job_id)
         if not job or job["status"] != "ready" or not job["public_text"]:
-            return self._response(start_response, self._layout("Not available", "<h1>Cover letter unavailable.</h1>"), "404 Not Found")
+            return self._response(start_response, self._layout("Not available", "<h1>Cover letter unavailable.</h1>", profile_id=profile_id), "404 Not Found")
         content = f'<p class="meta">REDACTED SAMPLE</p><h1>{html.escape(job["title"])}</h1><pre>{html.escape(job["public_text"])}</pre><p class="meta">Personal contact details and signature are intentionally omitted.</p>'
-        return self._response(start_response, self._layout("Cover letter sample", content))
+        return self._response(start_response, self._layout("Cover letter sample", content, profile_id=profile_id))
 
-    def _login(self, environ: dict, start_response: Callable):
+    def _login(self, environ: dict, start_response: Callable, profile_id: str = "kk"):
         if environ["REQUEST_METHOD"] == "POST":
             form = self._read_form(environ)
             if self.password_hash and verify_password(form.get("password", ""), self.password_hash):
                 token = self._new_session()
                 secure = "; Secure" if self.secure_cookie else ""
                 cookie = f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200{secure}"
-                return self._redirect(start_response, "/admin", [("Set-Cookie", cookie)])
+                return self._redirect(start_response, f"/admin/{profile_id}", [("Set-Cookie", cookie)])
             error = '<p class="error">Invalid password.</p>'
         else:
             error = ""
         content = f'<p class="meta">PRIVATE AREA</p><h1>Admin sign in</h1>{error}<form method="post"><label>Password <input type="password" name="password" required autocomplete="current-password"></label> <button>Sign in</button></form>'
-        return self._response(start_response, self._layout("Admin sign in", content))
+        return self._response(start_response, self._layout("Admin sign in", content, profile_id=profile_id))
 
-    def _admin(self, environ: dict, start_response: Callable):
+    def _admin(self, environ: dict, start_response: Callable, profile_id: str = "kk"):
         if not self._session_valid(environ):
-            return self._redirect(start_response, "/admin/login")
+            return self._redirect(start_response, f"/admin/{profile_id}/login")
         csrf = self._csrf(environ)
-        jobs = self.store.admin_jobs()
+        jobs = self._profile_store(profile_id).admin_jobs()
         applied_count = sum(bool(job["applied"]) for job in jobs)
         cards = []
         for job in jobs:
@@ -325,25 +336,25 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             cards.append(f"""<section class="card"><h2><a href="{html.escape(job['url'], quote=True)}">{html.escape(job['title'])}</a></h2>
 <p class="meta">{html.escape(job['company'])} · score {html.escape(str(job['score'] or ''))} · letter {html.escape(job['status'])}</p>
 <details><summary>Cover letter</summary><pre id="letter-{job['job_id']}">{full}</pre><button type="button" onclick="navigator.clipboard.writeText(document.getElementById('letter-{job['job_id']}').innerText)">Copy</button></details>
-<form method="post" action="/admin/jobs/{job['job_id']}/application"><input type="hidden" name="csrf" value="{csrf}"><label><input type="checkbox" name="applied" value="1" {checked}> Applied</label><textarea name="notes" placeholder="Private notes">{html.escape(job['notes'] or '')}</textarea><button>Save</button></form>
-<form method="post" action="/admin/jobs/{job['job_id']}/regenerate"><input type="hidden" name="csrf" value="{csrf}"><button>Regenerate cover letter</button></form></section>""")
+<form method="post" action="/admin/{profile_id}/jobs/{job['job_id']}/application"><input type="hidden" name="csrf" value="{csrf}"><label><input type="checkbox" name="applied" value="1" {checked}> Applied</label><textarea name="notes" placeholder="Private notes">{html.escape(job['notes'] or '')}</textarea><button>Save</button></form>
+<form method="post" action="/admin/{profile_id}/jobs/{job['job_id']}/regenerate"><input type="hidden" name="csrf" value="{csrf}"><button>Regenerate cover letter</button></form></section>""")
         stats = f'<section class="stats"><div class="stat"><span>Tracked jobs</span><b>{len(jobs)}</b></div><div class="stat"><span>Applications sent</span><b>{applied_count}</b></div></section>'
-        return self._response(start_response, self._layout("Private dashboard", '<p class="meta">ADMIN ONLY</p><h1>Your application dashboard.</h1>' + stats + "".join(cards), admin=True))
+        return self._response(start_response, self._layout("Private dashboard", '<p class="meta">ADMIN ONLY</p><h1>Your application dashboard.</h1>' + stats + "".join(cards), admin=True, profile_id=profile_id))
 
-    def _admin_action(self, environ: dict, start_response: Callable, job_id: str, action: str):
+    def _admin_action(self, environ: dict, start_response: Callable, profile_id: str, job_id: str, action: str):
         if not self._session_valid(environ):
             return self._response(start_response, "Unauthorized", "401 Unauthorized")
         form = self._read_form(environ)
         if not hmac.compare_digest(form.get("csrf", ""), self._csrf(environ)):
             return self._response(start_response, "Invalid CSRF token", "403 Forbidden")
         if action == "regenerate":
-            self.store.regenerate(job_id)
+            self._profile_store(profile_id).regenerate(job_id)
         elif action == "application":
-            self.store.set_application(job_id, form.get("applied") == "1", form.get("notes", ""))
-        return self._redirect(start_response, "/admin")
+            self._profile_store(profile_id).set_application(job_id, form.get("applied") == "1", form.get("notes", ""))
+        return self._redirect(start_response, f"/admin/{profile_id}")
 
-    def _sync_api(self, environ: dict, start_response: Callable):
-        if not self._sync_authorized(environ):
+    def _sync_api(self, environ: dict, start_response: Callable, profile_id: str = "kk"):
+        if not self._sync_authorized(environ, profile_id):
             return self._json_response(start_response, {"error": "unauthorized"}, "401 Unauthorized")
         try:
             payload = self._read_json(environ)
@@ -356,9 +367,10 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             if not isinstance(snapshots, list) or len(snapshots) > 120:
                 raise ValueError("trend_snapshots must be a list of at most 120 items")
             prepared_snapshots = [prepare_trend_snapshot(item) for item in snapshots]
-            synced_jobs = self.store.sync_jobs(jobs)
-            synced_snapshots = self.store.sync_trend_snapshots(prepared_snapshots)
-            current = self.store.record_trend_snapshot()
+            store = self._profile_store(profile_id)
+            synced_jobs = store.sync_jobs(jobs)
+            synced_snapshots = store.sync_trend_snapshots(prepared_snapshots)
+            current = store.record_trend_snapshot()
             return self._json_response(start_response, {
                 "synced": synced_jobs,
                 "trend_snapshots": synced_snapshots,
@@ -380,25 +392,49 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             except OSError:
                 return self._response(start_response, "Asset not available", "404 Not Found")
         if path == "/api/v1/state" and method == "GET":
-            if not self._sync_authorized(environ):
+            if not self._sync_authorized(environ, "kk"):
                 return self._json_response(start_response, {"error": "unauthorized"}, "401 Unauthorized")
-            return self._json_response(start_response, self.store.cloud_state())
+            return self._json_response(start_response, self._profile_store("kk").cloud_state())
         if path == "/api/v1/sync" and method == "POST":
-            return self._sync_api(environ, start_response)
+            return self._sync_api(environ, start_response, "kk")
+        match = re.match(r"^/api/v1/profiles/(kk|sandra)/(state|sync)$", path)
+        if match:
+            profile_id, action = match.groups()
+            if action == "state" and method == "GET":
+                if not self._sync_authorized(environ, profile_id):
+                    return self._json_response(start_response, {"error": "unauthorized"}, "401 Unauthorized")
+                return self._json_response(start_response, self._profile_store(profile_id).cloud_state())
+            if action == "sync" and method == "POST":
+                return self._sync_api(environ, start_response, profile_id)
         if method == "GET" and path == "/":
-            return self._public_home(environ, start_response)
+            return self._public_home(environ, start_response, "kk")
+        match = re.match(r"^/jobs/(kk|sandra)$", path)
+        if method == "GET" and match:
+            return self._public_home(environ, start_response, match.group(1))
         if method == "GET" and path == "/faq":
             return self._faq(start_response)
         match = re.match(r"^/jobs/([a-f0-9]{24})/cover-letter$", path)
         if method == "GET" and match:
-            return self._public_letter(match.group(1), start_response)
+            return self._public_letter("kk", match.group(1), start_response)
+        match = re.match(r"^/jobs/(kk|sandra)/([a-f0-9]{24})/cover-letter$", path)
+        if method == "GET" and match:
+            return self._public_letter(match.group(1), match.group(2), start_response)
         if path == "/admin/login" and method in {"GET", "POST"}:
-            return self._login(environ, start_response)
+            return self._login(environ, start_response, "kk")
         if path == "/admin" and method == "GET":
-            return self._admin(environ, start_response)
+            return self._admin(environ, start_response, "kk")
+        match = re.match(r"^/admin/(kk|sandra)/login$", path)
+        if match and method in {"GET", "POST"}:
+            return self._login(environ, start_response, match.group(1))
+        match = re.match(r"^/admin/(kk|sandra)$", path)
+        if match and method == "GET":
+            return self._admin(environ, start_response, match.group(1))
         match = re.match(r"^/admin/jobs/([a-f0-9]{24})/(regenerate|application)$", path)
         if method == "POST" and match:
-            return self._admin_action(environ, start_response, match.group(1), match.group(2))
+            return self._admin_action(environ, start_response, "kk", match.group(1), match.group(2))
+        match = re.match(r"^/admin/(kk|sandra)/jobs/([a-f0-9]{24})/(regenerate|application)$", path)
+        if method == "POST" and match:
+            return self._admin_action(environ, start_response, match.group(1), match.group(2), match.group(3))
         return self._response(start_response, self._layout("Not found", "<h1>Not found.</h1>"), "404 Not Found")
 
 
@@ -406,15 +442,22 @@ def create_application() -> CoverLetterWebApp:
     password_hash = os.getenv("COVER_LETTER_ADMIN_PASSWORD_HASH", "")
     secret_key = os.getenv("COVER_LETTER_SECRET_KEY", "")
     sync_token = os.getenv("COVER_LETTER_SYNC_TOKEN", "")
-    if not password_hash or not secret_key or not sync_token:
+    sandra_sync_token = os.getenv("COVER_LETTER_SYNC_TOKEN_SANDRA", "")
+    if not password_hash or not secret_key or not sync_token or not sandra_sync_token:
         raise RuntimeError("Admin password hash, session secret, and sync token are required")
     database_url = os.getenv("DATABASE_URL", "")
     if database_url:
         from cloud_store import PostgresCoverLetterStore
-        store = PostgresCoverLetterStore(database_url)
+        stores = {
+            profile: PostgresCoverLetterStore(database_url, profile)
+            for profile in PROFILES
+        }
     else:
-        store = CoverLetterStore(os.getenv("COVER_LETTER_DB", DEFAULT_DB))
-    return CoverLetterWebApp(store, password_hash, secret_key, secure_cookie=True, sync_token=sync_token)
+        stores = {
+            "kk": CoverLetterStore(os.getenv("COVER_LETTER_DB", DEFAULT_DB), "kk"),
+            "sandra": CoverLetterStore(os.getenv("COVER_LETTER_DB_SANDRA", "profiles/sandra/state/cover_letters.db"), "sandra"),
+        }
+    return CoverLetterWebApp(stores, password_hash, secret_key, secure_cookie=True, sync_token={"kk": sync_token, "sandra": sandra_sync_token})
 
 
 def main() -> int:

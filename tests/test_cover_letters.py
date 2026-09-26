@@ -5,8 +5,9 @@ import unittest
 import uuid
 from datetime import timedelta
 from urllib.parse import urlencode
+from unittest.mock import Mock, patch
 
-from cover_letters import CoverLetterStore, iso_utc, utc_now
+from cover_letters import CoverLetterStore, iso_utc, job_id_for_url, make_public_sample, utc_now
 from cover_letter_web import CoverLetterWebApp, hash_password
 from cloud_store import prepare_sync_record
 
@@ -55,6 +56,45 @@ class CoverLetterStoreTests(unittest.TestCase):
             "description": description or ("Develop embedded software and tests. " * 20),
         }
 
+    def test_same_url_has_profile_scoped_identity_without_changing_legacy_kk_id(self):
+        url = "https://example.test/jobs/42?tracking=abc"
+        self.assertEqual(job_id_for_url(url), job_id_for_url(url, "kk"))
+        self.assertNotEqual(job_id_for_url(url, "kk"), job_id_for_url(url, "sandra"))
+
+    def test_sandra_public_sample_removes_private_family_motivation(self):
+        full = valid_english_letter().replace(
+            "Dear Hiring Manager,",
+            "Dear Hiring Manager,\n\nMy husband lives in Germany, and I am learning German while seeking international experience.",
+        )
+        public = make_public_sample(full, profile_id="sandra")
+        self.assertNotIn("husband", public.lower())
+        self.assertIn("Development experience", public)
+
+    def test_sandra_automatic_batch_excludes_legacy_and_low_score_jobs(self):
+        store = CoverLetterStore(self.db, profile_id="sandra")
+        legacy = self.job("https://example.test/jobs/legacy")
+        legacy["auto_letter_eligible"] = False
+        store.enqueue_job(legacy)
+        low = self.job("https://example.test/jobs/low")
+        low["score"] = 7
+        store.enqueue_job(low)
+        high = self.job("https://example.test/jobs/high")
+        high["score"] = 9
+        high_id = store.enqueue_job(high)
+        self.assertEqual(
+            [row["job_id"] for row in store.claim_batch(10, min_score=8, eligible_only=True)],
+            [high_id],
+        )
+
+    def test_sandra_daily_cap_survives_repeated_claims(self):
+        store = CoverLetterStore(self.db, profile_id="sandra")
+        store.enqueue_job(self.job("https://example.test/jobs/cap-1"))
+        store.enqueue_job(self.job("https://example.test/jobs/cap-2"))
+        claimed = store.claim_batch(1, min_score=8, eligible_only=True, daily_limit=1)
+        self.assertEqual(len(claimed), 1)
+        store.commit_result(claimed[0]["job_id"], valid_english_letter(), "en")
+        self.assertEqual(store.claim_batch(10, min_score=8, eligible_only=True, daily_limit=1), [])
+
     def test_inadequate_description_is_unavailable(self):
         job_id = self.store.enqueue_job(self.job(description="Too short"))
         self.assertEqual(self.store.get_admin_job(job_id)["status"], "unavailable")
@@ -92,6 +132,21 @@ class CoverLetterStoreTests(unittest.TestCase):
         retry = self.store.claim_batch(10)
         self.assertEqual([row["job_id"] for row in retry], [second])
         self.assertEqual(self.store.get_admin_job(first)["status"], "ready")
+
+    def test_run_lease_allows_one_owner_and_expires(self):
+        now = utc_now()
+        self.assertTrue(self.store.acquire_run_lease("first-run", lease_minutes=15, now=now))
+        self.assertFalse(self.store.acquire_run_lease("second-run", lease_minutes=15, now=now))
+        self.assertTrue(self.store.acquire_run_lease("second-run", lease_minutes=15, now=now + timedelta(minutes=16)))
+
+    def test_run_lease_renewal_and_release_require_the_owner(self):
+        now = utc_now()
+        self.assertTrue(self.store.acquire_run_lease("first-run", now=now))
+        self.assertFalse(self.store.renew_run_lease("second-run", now=now + timedelta(minutes=1)))
+        self.assertFalse(self.store.release_run_lease("second-run"))
+        self.assertTrue(self.store.renew_run_lease("first-run", now=now + timedelta(minutes=1)))
+        self.assertTrue(self.store.release_run_lease("first-run"))
+        self.assertTrue(self.store.acquire_run_lease("second-run", now=now + timedelta(minutes=1)))
 
     def test_evidence_version_change_clears_stale_letter(self):
         job = self.job()
@@ -186,6 +241,27 @@ class CoverLetterStoreTests(unittest.TestCase):
         self.assertEqual(result["trend_snapshots"], 1)
         self.assertEqual(self.store.trend_snapshots(), [snapshot])
 
+    def test_kk_cloud_sync_falls_back_to_legacy_routes_on_profile_404(self):
+        missing = Mock(status_code=404)
+        legacy_state = Mock(status_code=200)
+        legacy_state.json.return_value = {
+            "applications": [],
+            "regeneration_requests": [],
+            "trend_snapshots": [],
+        }
+        pushed = Mock(status_code=200)
+        pushed.json.return_value = {"ok": True}
+
+        with patch("requests.get", side_effect=[missing, legacy_state]) as get, patch(
+            "requests.post", return_value=pushed
+        ) as post:
+            result = self.store.sync_cloud("https://example.test", "secret")
+
+        self.assertEqual(get.call_args_list[0].args[0], "https://example.test/api/v1/profiles/kk/state")
+        self.assertEqual(get.call_args_list[1].args[0], "https://example.test/api/v1/state")
+        self.assertEqual(post.call_args.args[0], "https://example.test/api/v1/sync")
+        self.assertEqual(result["pushed"], {"ok": True})
+
     def test_public_jobs_support_independent_and_combined_sorting(self):
         now = utc_now()
         fixtures = [
@@ -246,6 +322,24 @@ class CloudPayloadTests(unittest.TestCase):
         self.assertNotIn("@", prepared["public_text"])
         with self.assertRaisesRegex(ValueError, "job ID"):
             prepare_sync_record({**raw, "job_id": "wrong"})
+
+    def test_server_scopes_identity_and_redaction_to_profile(self):
+        raw = {
+            "url": "https://example.test/jobs/shared",
+            "title": "AI Engineer",
+            "description": "Build grounded machine learning services. " * 30,
+            "status": "ready",
+            "language": "en",
+            "full_text": valid_english_letter().replace(
+                "Dear Hiring Manager,",
+                "Dear Hiring Manager,\n\nMy husband lives in Germany, and I am learning German while seeking international experience.",
+            ),
+        }
+        kk = prepare_sync_record(raw, "kk")
+        sandra = prepare_sync_record(raw, "sandra")
+        self.assertNotEqual(kk["job_id"], sandra["job_id"])
+        self.assertEqual(sandra["profile_id"], "sandra")
+        self.assertNotIn("husband", sandra["public_text"].lower())
 
 
 class WebPrivacyTests(unittest.TestCase):
@@ -409,6 +503,80 @@ class WebPrivacyTests(unittest.TestCase):
         with self.store.connection() as conn:
             count = conn.execute("SELECT COUNT(*) FROM jobs WHERE job_id=?", (self.job_id,)).fetchone()[0]
         self.assertEqual(count, 1)
+
+
+class MultiProfileWebTests(unittest.TestCase):
+    def setUp(self):
+        self.paths = {
+            profile: os.path.join(TEST_TEMP_ROOT, f"web-{profile}-{uuid.uuid4().hex}.db")
+            for profile in ("kk", "sandra")
+        }
+        self.stores = {
+            profile: CoverLetterStore(path, profile_id=profile)
+            for profile, path in self.paths.items()
+        }
+        for profile, store in self.stores.items():
+            store.enqueue_job({
+                "url": "https://example.test/jobs/shared",
+                "title": f"{profile.title()} Role",
+                "company": "Example GmbH",
+                "source": "LinkedIn",
+                "score": 9,
+                "description": "Build and validate production software systems. " * 20,
+            })
+        self.app = CoverLetterWebApp(
+            self.stores,
+            hash_password("correct horse"),
+            "test-secret",
+            secure_cookie=False,
+            sync_token={"kk": "kk-secret", "sandra": "sandra-secret"},
+        )
+
+    def tearDown(self):
+        for path in self.paths.values():
+            for suffix in ("", "-shm", "-wal"):
+                candidate = path + suffix
+                if os.path.exists(candidate):
+                    os.remove(candidate)
+
+    def request(self, path, method="GET", data=None, token="", cookie=""):
+        body = urlencode(data or {}).encode()
+        captured = {}
+        path_info, _, query_string = path.partition("?")
+        environ = {
+            "PATH_INFO": path_info,
+            "QUERY_STRING": query_string,
+            "REQUEST_METHOD": method,
+            "CONTENT_LENGTH": str(len(body)),
+            "wsgi.input": io.BytesIO(body),
+            "HTTP_COOKIE": cookie,
+            "HTTP_AUTHORIZATION": token,
+        }
+        def start(status, headers):
+            captured["status"] = status
+            captured["headers"] = headers
+        return captured, b"".join(self.app(environ, start)).decode()
+
+    def test_profile_selector_and_lists_are_isolated(self):
+        _, kk = self.request("/jobs/kk")
+        _, sandra = self.request("/jobs/sandra")
+        self.assertIn("Kk Role", kk)
+        self.assertNotIn("Sandra Role", kk)
+        self.assertIn("Sandra Role", sandra)
+        self.assertNotIn("Kk Role", sandra)
+        self.assertIn("KK Jobs", sandra)
+        self.assertIn("Sandra Jobs", sandra)
+
+    def test_profile_tokens_fail_closed(self):
+        captured, _ = self.request("/api/v1/profiles/sandra/state", token="Bearer kk-secret")
+        self.assertTrue(captured["status"].startswith("401"))
+        captured, body = self.request("/api/v1/profiles/sandra/state", token="Bearer sandra-secret")
+        self.assertTrue(captured["status"].startswith("200"))
+        self.assertIn('"applications"', body)
+
+    def test_legacy_kk_state_route_remains_available(self):
+        captured, _ = self.request("/api/v1/state", token="Bearer kk-secret")
+        self.assertTrue(captured["status"].startswith("200"))
 
 
 if __name__ == "__main__":

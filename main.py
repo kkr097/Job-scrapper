@@ -23,7 +23,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scraper import JobScraper
 from exporter import append_new_to_excel, append_new_to_csv, load_existing_urls, load_cache, save_cache, prune_cache
+from language_filter import mandatory_german_requirement
 from resume_parser import get_resume_summary, generate_config_from_resume, parse_resume
+from profile_workspace import ProfileWorkspace
+
+
+ACTIVE_WORKSPACE = None
+
+
+def _state_path(name: str) -> str:
+    if ACTIVE_WORKSPACE is None:
+        raise RuntimeError("profile workspace is not loaded")
+    return str(ACTIVE_WORKSPACE.output_path(name))
 
 
 def _enqueue_cover_letter(job: dict, config: dict) -> None:
@@ -31,11 +42,8 @@ def _enqueue_cover_letter(job: dict, config: dict) -> None:
     try:
         from cover_letters import CoverLetterStore
 
-        db_path = os.path.join(
-            os.path.dirname(__file__),
-            config.get("cover_letter_db", "cover_letters.db")
-        )
-        CoverLetterStore(db_path).enqueue_job(job)
+        db_path = _state_path(config.get("cover_letter_db", "cover_letters.db"))
+        CoverLetterStore(db_path, ACTIVE_WORKSPACE.profile_id).enqueue_job(job)
     except Exception as error:
         print(f"   ⚠ Cover-letter queue unavailable: {error}")
 
@@ -73,17 +81,19 @@ def _apply_env_keys(config: dict) -> dict:
     return config
 
 
-def load_config(force_regen: bool = False):
+def load_config(profile_id: str, force_regen: bool = False):
     """Load configuration from config.json, generate it from resume if missing."""
-    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
-    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    global ACTIVE_WORKSPACE
+    ACTIVE_WORKSPACE = ProfileWorkspace.load(profile_id)
+    config_path = str(ACTIVE_WORKSPACE.private_path('config.json'))
+    env_path = str(ACTIVE_WORKSPACE.private_path('.env'))
     # Ensure .env values override any pre-set shell environment variables.
     load_dotenv(env_path, override=True)
     if force_regen or not os.path.exists(config_path):
         print("   âš  config.json not found. Generating from resume PDF...")
         defaults = _load_defaults()
         config = generate_config_from_resume(
-            folder=os.path.dirname(__file__),
+            folder=str(ACTIVE_WORKSPACE.private_dir),
             default_locations=defaults.get("search", {}).get("location", ["Germany"]),
             exclude_keywords=defaults.get("exclude_keywords", []),
             exclude_description_keywords=defaults.get("exclude_description_keywords", []),
@@ -190,6 +200,7 @@ def _score_success(job: dict) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description='Job Scraper - Find jobs matching your resume')
+    parser.add_argument('--profile', required=True, choices=('kk', 'sandra'), help='Required isolated candidate profile')
     parser.add_argument('--no-rate', action='store_true', help='Skip AI rating (test mode)')
     parser.add_argument('--scrape-only', action='store_true', help='Scrape and queue jobs only (no scoring)')
     parser.add_argument('--score-only', action='store_true', help='Score only pending jobs (scheduled mode)')
@@ -205,14 +216,14 @@ def main():
     print("=" * 60)
     
     # Load config
-    config = load_config(force_regen=args.regen_config)
+    config = load_config(args.profile, force_regen=args.regen_config)
     scrape_test_mode = bool(config.get("scrape_test_mode", False))
     
     # Get output path
     output_file = args.output or config['output'].get('excel_file', 'daily_jobs.xlsx')
     
     # Step 1: Load candidate profile (prefer explicit JSON, fallback to resume)
-    candidate_path = os.path.join(os.path.dirname(__file__), "candidate_profile.json")
+    candidate_path = str(ACTIVE_WORKSPACE.private_path("candidate_profile.json"))
     if os.path.exists(candidate_path):
         print("\nðŸ“„ Step 1: Loading candidate_profile.json...")
         try:
@@ -228,8 +239,8 @@ def main():
     if candidate_profile is None:
         print("\nðŸ“„ Step 1: Reading resume...")
         try:
-            resume_summary = get_resume_summary(os.path.dirname(__file__))
-            resume_data = parse_resume(os.path.dirname(__file__))
+            resume_summary = get_resume_summary(str(ACTIVE_WORKSPACE.private_dir))
+            resume_data = parse_resume(str(ACTIVE_WORKSPACE.private_dir))
             candidate_profile = {
                 "summary": resume_summary,
                 "skills": resume_data.get("skills", []),
@@ -253,21 +264,36 @@ def main():
     negative_description_kw = matching_rules.get("negative_description_keywords", [])
     negative_title_kw = [k.strip().lower() for k in negative_title_kw if isinstance(k, str) and k.strip()]
     negative_description_kw = [k.strip().lower() for k in negative_description_kw if isinstance(k, str) and k.strip()]
+    exclude_mandatory_german = bool(config.get("exclude_mandatory_german", False))
+    candidate_german_level = str(config.get("candidate_german_level", "A2")).upper()
+    reject_any_mandatory_german = bool(config.get("reject_any_mandatory_german", True))
+    reject_path = _state_path("rejected_jobs.csv")
+    rejected_urls = set()
 
     def _contains_keyword(text: str, keyword: str) -> bool:
         """Match terms without treating short words as arbitrary substrings."""
         return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text, re.IGNORECASE) is not None
 
-    def _has_skip_keyword(job: dict) -> bool:
+    def _rejection_reason(job: dict) -> str:
         title = (job.get("title") or "").lower()
         desc = (job.get("description") or "").lower()
-        return any(_contains_keyword(title, k) for k in negative_title_kw) or any(
-            _contains_keyword(desc, k) for k in negative_description_kw
-        )
+        for keyword in negative_title_kw:
+            if _contains_keyword(title, keyword):
+                return f"Excluded title keyword: {keyword}"
+        for keyword in negative_description_kw:
+            if _contains_keyword(desc, keyword):
+                return f"Excluded description keyword: {keyword}"
+        if exclude_mandatory_german:
+            return mandatory_german_requirement(
+                desc, candidate_german_level, reject_any_mandatory=reject_any_mandatory_german
+            ) or ""
+        return ""
 
-    def _append_rejected(job: dict) -> None:
+    def _has_skip_keyword(job: dict) -> bool:
+        return bool(_rejection_reason(job))
+
+    def _append_rejected(job: dict, reason: str = "") -> None:
         # Keep a FIFO list (max 100) of rejected jobs for review.
-        reject_path = os.path.join(os.path.dirname(__file__), "rejected_jobs.csv")
         rows = []
         if os.path.exists(reject_path):
             with open(reject_path, newline="", encoding="utf-8") as f:
@@ -289,33 +315,36 @@ def main():
             )
             writer.writeheader()
             writer.writerows(rows)
+        if job.get("url"):
+            rejected_urls.add(str(job["url"]).strip().lower())
     
     print("   • Step 1 complete, moving to Step 2...", flush=True)
     try:
-        with open(os.path.join(os.path.dirname(__file__), "debug_step2.log"), "a", encoding="utf-8") as f:
+        with open(_state_path("debug_step2.log"), "a", encoding="utf-8") as f:
             f.write(f"{datetime.now().isoformat(timespec='seconds')} reached-after-step1\n")
     except Exception as e:
         print(f"   ⚠ Debug log write failed: {e}", flush=True)
     # Step 2: Scrape jobs or score-only
     print("\nStep 2: Scraping job sites...", flush=True)
     try:
-        with open(os.path.join(os.path.dirname(__file__), "debug_step2.log"), "a", encoding="utf-8") as f:
+        with open(_state_path("debug_step2.log"), "a", encoding="utf-8") as f:
             f.write(f"{datetime.now().isoformat(timespec='seconds')} reached-step2-print\n")
     except Exception as e:
         print(f"   ⚠ Debug log write failed: {e}", flush=True)
     scraper = JobScraper(config)
 
     pending_file = config.get("score_pending_file", "score_pending_jobs.csv")
-    pending_path = os.path.join(os.path.dirname(__file__), pending_file)
+    pending_path = _state_path(pending_file)
 
     daily_file = args.output or config['output'].get('excel_file', 'daily_jobs.csv')
-    daily_path = os.path.join(os.path.dirname(__file__), daily_file)
+    daily_path = _state_path(daily_file)
     nonmatch_file = config.get('output_nonmatch_file', 'daily_jobs_nonmatch.csv')
-    nonmatch_path = os.path.join(os.path.dirname(__file__), nonmatch_file)
+    nonmatch_path = _state_path(nonmatch_file)
 
     if not scrape_test_mode:
         scored_urls = load_existing_urls(daily_path) | load_existing_urls(nonmatch_path)
         pending_urls = _load_pending_urls(pending_path)
+        rejected_urls = load_existing_urls(reject_path)
     else:
         scored_urls = set()
         pending_urls = set()
@@ -323,15 +352,14 @@ def main():
     def _queue_job(job: dict):
         if scrape_test_mode:
             return
-        # Manual filter: skip jobs whose TITLE or DESCRIPTION contains any negative title keyword.
-        if _has_skip_keyword(job):
-            _append_rejected(job)
-            return
         url = (job.get("url") or "").strip()
         if not url:
             return
         url_l = url.lower()
-        if url_l in scored_urls or url_l in pending_urls:
+        if url_l in scored_urls or url_l in pending_urls or url_l in rejected_urls:
+            return
+        if _has_skip_keyword(job):
+            _append_rejected(job, _rejection_reason(job))
             return
         row = {
             "url": url,
@@ -360,7 +388,7 @@ def main():
         max_per_day = int(config.get("scoring_max_per_day", 40))
         cooldown = int(config.get("scoring_cooldown_seconds", 300))
         daily_log = config.get("scoring_daily_log", "scoring_daily_log.json")
-        daily_log_path = os.path.join(os.path.dirname(__file__), daily_log)
+        daily_log_path = _state_path(daily_log)
         scored_today = 0 if args.score_only_manual else _load_daily_count(daily_log_path)
 
         # Prepare rater
@@ -440,6 +468,11 @@ def main():
                     url_l = url.lower()
                     if not url:
                         continue
+                    if job.get("language_eligible") is False:
+                        _append_rejected(job, job.get("language_rejection_reason", ""))
+                        _remove_pending_url(pending_path, url)
+                        print(f"   Rejected mandatory German requirement: {url}")
+                        continue
                     if _score_success(job):
                         if job.get("score", 0) >= config.get("min_score", 5):
                             append_new_to_csv([job], daily_path)
@@ -486,7 +519,7 @@ def main():
 
     # Default: scrape + queue + score
     jobs = scraper.scrape_all(on_job=None if scrape_test_mode else _queue_job)
-    if negative_title_kw or negative_description_kw:
+    if negative_title_kw or negative_description_kw or exclude_mandatory_german:
         filtered = []
         for j in jobs:
             if _has_skip_keyword(j):
@@ -522,7 +555,7 @@ def main():
                 output_file = args.output or config['output'].get('excel_file', 'daily_jobs.csv')
                 nonmatch_file = config.get('output_nonmatch_file', 'daily_jobs_nonmatch.csv')
                 cache_file = config.get('cache_file', 'seen_jobs_cache.json')
-                cache_path = os.path.join(os.path.dirname(__file__), cache_file)
+                cache_path = _state_path(cache_file)
                 cache = load_cache(cache_path)
                 cache = prune_cache(cache, int(config.get("cache_days", 45)))
 
@@ -540,6 +573,15 @@ def main():
                     jobs = already_scored + rated
                 else:
                     jobs = already_scored
+
+                language_eligible_jobs = []
+                for job in jobs:
+                    if job.get("language_eligible") is False:
+                        _append_rejected(job, job.get("language_rejection_reason", ""))
+                        _remove_pending_url(pending_path, job.get("url", ""))
+                    else:
+                        language_eligible_jobs.append(job)
+                jobs = language_eligible_jobs
 
                 # Update cache with newly scored jobs
                 for j in jobs:
@@ -610,11 +652,11 @@ def main():
 
     # Step 4: Export to file (Excel/CSV)
     print("\nðŸ“Š Step 4: Exporting to file...")
-    output_path = os.path.join(os.path.dirname(__file__), output_file)
+    output_path = _state_path(output_file)
     if output_path.lower().endswith(".csv"):
         append_new_to_csv(matches, output_path)
         nonmatch_file = config.get('output_nonmatch_file', 'daily_jobs_nonmatch.csv')
-        nonmatch_path = os.path.join(os.path.dirname(__file__), nonmatch_file)
+        nonmatch_path = _state_path(nonmatch_file)
         append_new_to_csv(nonmatches, nonmatch_path)
     else:
         append_new_to_excel(matches, output_path)

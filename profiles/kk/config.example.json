@@ -1,0 +1,16 @@
+{
+  "profile_id": "kk",
+  "display_name": "KK",
+  "min_score": 6,
+  "rating_preferred": "lmstudio",
+  "lmstudio_enabled": true,
+  "lmstudio_api_base": "http://127.0.0.1:1234/v1",
+  "sources": {"linkedin": true, "xing": true, "company_careers": false},
+  "linkedin_search_urls": ["https://www.linkedin.com/jobs/search?..."],
+  "xing_search_urls": ["https://www.xing.com/jobs/search/ki?..."],
+  "score_pending_file": "score_pending_jobs.csv",
+  "output": {"excel_file": "daily_jobs.csv"},
+  "output_nonmatch_file": "daily_jobs_nonmatch.csv",
+  "cache_file": "seen_jobs_cache.json",
+  "cover_letter_db": "cover_letters.db"
+}
