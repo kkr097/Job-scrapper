@@ -291,14 +291,14 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
 <details><summary>What do active and expired mean here?</summary><p>Active jobs are from the most recent 14-day window. “Expired” means the record is 15–28 days old within this project; it is not necessarily confirmed closed by the employer. The original link may remain open or may already have disappeared.</p></details>
 <details><summary>What does the 3 Month Job Trend show?</summary><p>Each successful weekday synchronization records the number shown in “Jobs in last 14 days.” The graph uses only genuine snapshots, so weekends and failed runs can appear as gaps and unavailable history is not invented.</p></details></section>
 <section class="card"><h2>Cover letters and privacy</h2>
-<details><summary>What is a cover-letter sample?</summary><p>It is a redacted example generated for KK using evidence from his reviewed career documents and the specific job description. Visitors can use it for inspiration, but it is not a truthful application for another person and should not be copied unchanged.</p></details>
+<details><summary>What is a cover-letter sample?</summary><p>It is a redacted example generated for the selected candidate using evidence from that candidate's reviewed career documents and the specific job description. Visitors can use it for inspiration, but it is not a truthful application for another person and should not be copied unchanged.</p></details>
 <details><summary>Why is a cover letter sometimes unavailable?</summary><p>A letter is produced only when the job description contains enough information for a grounded result. Missing or inadequate descriptions are marked unavailable instead of being filled with invented claims.</p></details>
-<details><summary>What can guests see?</summary><p>Guests can view job information, original links, age and score data, the trend, and redacted letter samples. They do not need an account or ChatGPT. Complete letters, application status, private notes, and administrative actions remain available only in KK’s authenticated dashboard.</p></details>
+<details><summary>What can guests see?</summary><p>Guests can view job information, original links, age and score data, the trend, and redacted letter samples. They do not need an account or ChatGPT. Complete letters, application status, private notes, and administrative actions remain available only in the authenticated dashboard.</p></details>
 <details><summary>What personal information is protected?</summary><p>Public letter samples remove contact details, signatures, private notes, and application tracking. Authorization and redaction are enforced by the server rather than relying on the visitor’s browser.</p></details></section>
 <section class="card"><h2>Technology, AI, and support</h2>
 <details><summary>What technology powers the project?</summary><p>The workflow is written in Python. LM Studio runs the local scoring model, SQLite keeps the recoverable local copy, Supabase stores the hosted data, and Render serves the public website. Scheduled automation connects the stages.</p></details>
-<details><summary>How were ChatGPT and Codex Cowork involved?</summary><p>KK developed the idea and made the product decisions with help from ChatGPT/Codex Cowork for planning, implementation, testing, automation, and cover-letter generation. Candidate claims remain grounded in KK’s reviewed documents, while job and application decisions remain human choices.</p></details>
-<details><summary>How long is information retained?</summary><p>Public jobs remain visible for no more than 28 days. Trend snapshots cover approximately three months. KK’s private applied-job history can be preserved separately from the guest-facing list.</p></details>
+<details><summary>How were ChatGPT and Codex Cowork involved?</summary><p>KK developed the idea and made the product decisions with help from ChatGPT/Codex Cowork for planning, implementation, testing, automation, and cover-letter generation. Candidate claims remain grounded in each candidate's reviewed documents, while job and application decisions remain human choices.</p></details>
+<details><summary>How long is information retained?</summary><p>Public jobs remain visible for no more than 28 days. Trend snapshots cover approximately three months. Each profile's private applied-job history can be preserved separately from the guest-facing list.</p></details>
 <details><summary>How can I support the project?</summary><p>Support is completely voluntary. The Buy me a coffee tile on the jobs page opens a PayPal QR code for anyone who finds the project useful and wants to support its running costs and continued improvement.</p></details></section>"""
         return self._response(start_response, self._layout("FAQ", content))
 
@@ -463,7 +463,7 @@ def create_application() -> CoverLetterWebApp:
 def main() -> int:
     import argparse
     import getpass
-    parser = argparse.ArgumentParser(description="Serve the KK Jobs cover-letter website")
+    parser = argparse.ArgumentParser(description="Serve the MatchAtlas cover-letter website")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--db", default=os.getenv("COVER_LETTER_DB", DEFAULT_DB))
