@@ -4,10 +4,18 @@ import os
 import unittest
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 from urllib.parse import urlencode
 from unittest.mock import Mock, patch
 
-from cover_letters import CoverLetterStore, iso_utc, job_id_for_url, make_public_sample, utc_now
+from cover_letters import (
+    CoverLetterStore,
+    iso_utc,
+    job_id_for_url,
+    make_public_sample,
+    utc_now,
+    validate_cover_letter,
+)
 from cover_letter_web import CoverLetterWebApp, hash_password
 from cloud_store import prepare_sync_record
 
@@ -32,6 +40,12 @@ def valid_english_letter():
     for seed in ("Development", "Verification", "Collaboration"):
         body.append(" ".join([seed] + ["experience"] * 94) + ".")
     return "\n".join(header + ["Dear Hiring Manager,", "", body[0], "", body[1], "", body[2], "", "Kind regards", "Krishnakumar Radhakrishna Panicker"])
+
+
+def english_letter_with_words(target):
+    template = "Application for Role\nDear Hiring Manager,\n\n{body}\n\nKind regards\nKrishnakumar Radhakrishna Panicker"
+    fixed = len(template.format(body="").split())
+    return template.format(body=" ".join(["experience"] * (target - fixed)))
 
 
 class CoverLetterStoreTests(unittest.TestCase):
@@ -86,6 +100,138 @@ class CoverLetterStoreTests(unittest.TestCase):
             [high_id],
         )
 
+    def test_scored_match_is_publication_pending_but_csv_import_is_not(self):
+        scored_id = self.store.enqueue_job(
+            self.job("https://example.test/jobs/live-now"), publish=True
+        )
+        imported_id = self.store.enqueue_job(
+            self.job("https://example.test/jobs/import-only"), publish=False
+        )
+
+        self.assertEqual(self.store.pending_publication_ids(), [scored_id])
+        self.assertEqual(self.store.get_public_job(scored_id)["status"], "queued")
+        self.assertNotIn(imported_id, self.store.pending_publication_ids())
+
+    def test_successful_publication_pushes_delta_and_acknowledges_only_that_profile(self):
+        job_id = self.store.enqueue_job(self.job("https://example.test/jobs/publish"), publish=True)
+        response = Mock(status_code=200)
+        response.json.return_value = {"mode": "delta", "synced": 1}
+        fake_requests = SimpleNamespace(post=Mock(return_value=response))
+
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            result = self.store.publish_pending_cloud("https://example.test", "secret", "run-1")
+
+        self.assertEqual(result["published"], 1)
+        self.assertEqual(result["pending"], 0)
+        self.assertEqual(self.store.pending_publication_ids(), [])
+        payload = fake_requests.post.call_args.kwargs["json"]
+        self.assertEqual(payload["mode"], "delta")
+        self.assertEqual([record["job_id"] for record in payload["jobs"]], [job_id])
+        self.assertNotIn("trend_snapshots", payload)
+
+    def test_failed_publication_stays_pending_for_a_later_retry(self):
+        job_id = self.store.enqueue_job(self.job("https://example.test/jobs/retry"), publish=True)
+        failed = Mock(status_code=500)
+        failed.raise_for_status.side_effect = RuntimeError("cloud unavailable")
+        successful = Mock(status_code=200)
+        successful.json.return_value = {"mode": "delta", "synced": 1}
+
+        with patch.dict("sys.modules", {"requests": SimpleNamespace(post=Mock(return_value=failed))}):
+            first = self.store.publish_pending_cloud("https://example.test", "secret", "run-1")
+        with patch.dict("sys.modules", {"requests": SimpleNamespace(post=Mock(return_value=successful))}):
+            second = self.store.publish_pending_cloud("https://example.test", "secret", "run-2")
+
+        self.assertEqual(first["published"], 0)
+        self.assertEqual(first["pending"], 1)
+        self.assertFalse(first["escalated"])
+        self.assertEqual(second["published"], 1)
+        self.assertEqual(second["pending"], 0)
+        self.assertEqual(self.store.pending_publication_ids(), [])
+        self.assertEqual(job_id, second["published_job_ids"][0])
+
+    def test_same_url_has_independent_profile_publication_queues(self):
+        sandra_db = os.path.join(TEST_TEMP_ROOT, f"sandra-publication-{uuid.uuid4().hex}.db")
+        sandra = CoverLetterStore(sandra_db, profile_id="sandra")
+        try:
+            kk_id = self.store.enqueue_job(self.job("https://example.test/jobs/shared-live"), publish=True)
+            sandra_id = sandra.enqueue_job(self.job("https://example.test/jobs/shared-live"), publish=True)
+
+            self.assertNotEqual(kk_id, sandra_id)
+            self.assertEqual(self.store.pending_publication_ids(), [kk_id])
+            self.assertEqual(sandra.pending_publication_ids(), [sandra_id])
+        finally:
+            for suffix in ("", "-shm", "-wal"):
+                path = sandra_db + suffix
+                if os.path.exists(path):
+                    os.remove(path)
+
+    def test_third_unsuccessful_publication_run_is_escalated(self):
+        self.store.enqueue_job(self.job("https://example.test/jobs/escalate"), publish=True)
+        failed = Mock(status_code=500)
+        failed.raise_for_status.side_effect = RuntimeError("cloud unavailable")
+        fake_requests = SimpleNamespace(post=Mock(return_value=failed))
+
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            first = self.store.publish_pending_cloud("https://example.test", "secret", "run-1")
+            second = self.store.publish_pending_cloud("https://example.test", "secret", "run-2")
+            third = self.store.publish_pending_cloud("https://example.test", "secret", "run-3")
+
+        self.assertFalse(first["escalated"])
+        self.assertFalse(second["escalated"])
+        self.assertTrue(third["escalated"])
+
+    def test_successful_full_reconciliation_acknowledges_pending_publication(self):
+        job_id = self.store.enqueue_job(self.job("https://example.test/jobs/full-reconcile"), publish=True)
+        response = Mock(status_code=200)
+        response.json.return_value = {"mode": "full", "synced": 1}
+        fake_requests = SimpleNamespace(post=Mock(return_value=response))
+
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            self.store.push_cloud("https://example.test", "secret", mode="full")
+
+        self.assertNotIn(job_id, self.store.pending_publication_ids())
+
+    def test_automatic_cutover_makes_existing_jobs_manual_only_but_not_new_jobs(self):
+        old_id = self.store.enqueue_job(self.job("https://example.test/jobs/pre-cutover"))
+        self.assertEqual(self.store.mark_existing_jobs_manual(), 1)
+        new_id = self.store.enqueue_job(self.job("https://example.test/jobs/post-cutover"))
+
+        claimed = self.store.claim_batch(40, min_score=8, eligible_only=True)
+
+        self.assertEqual([item["job_id"] for item in claimed], [new_id])
+        self.assertTrue(self.store.regenerate(old_id))
+        self.assertEqual(self.store.get_admin_job(old_id)["status"], "queued")
+
+    def test_automatic_claim_orders_newest_then_score_and_caps_at_forty(self):
+        now = utc_now()
+        newest_low = self.job("https://example.test/jobs/newest-low", iso_utc(now), None)
+        newest_low["score"] = 8
+        newest_high = self.job("https://example.test/jobs/newest-high", iso_utc(now), None)
+        newest_high["score"] = 10
+        older = self.job("https://example.test/jobs/older", iso_utc(now - timedelta(days=1)), None)
+        older["score"] = 10
+        expected = [
+            self.store.enqueue_job(newest_high),
+            self.store.enqueue_job(newest_low),
+            self.store.enqueue_job(older),
+        ]
+        for index in range(40):
+            self.store.enqueue_job(self.job(
+                f"https://example.test/jobs/filler-{index}",
+                iso_utc(now - timedelta(days=2, seconds=index)),
+            ))
+
+        claimed = self.store.claim_batch(400, min_score=8, eligible_only=True, owner="nightly")
+
+        self.assertEqual([item["job_id"] for item in claimed[:3]], expected)
+        self.assertEqual(len(claimed), 40)
+
+    def test_accepted_word_count_range_does_not_require_repair(self):
+        self.assertEqual(validate_cover_letter(english_letter_with_words(285))["words"], 285)
+        self.assertEqual(validate_cover_letter(english_letter_with_words(375))["words"], 375)
+        with self.assertRaisesRegex(ValueError, "285-375"):
+            validate_cover_letter(english_letter_with_words(284))
+
     def test_sandra_daily_cap_survives_repeated_claims(self):
         store = CoverLetterStore(self.db, profile_id="sandra")
         store.enqueue_job(self.job("https://example.test/jobs/cap-1"))
@@ -112,6 +258,30 @@ class CoverLetterStoreTests(unittest.TestCase):
         self.assertNotIn("Mit freundlichen", public["public_text"])
         self.assertNotIn("Krishnakumar Radhakrishna Panicker", public["public_text"])
         self.assertIn("Mit freundlichen", self.store.get_admin_job(job_id)["full_text"])
+
+    def test_chunk_commit_keeps_valid_results_when_one_item_fails(self):
+        failed_id = self.store.enqueue_job(self.job("https://example.test/jobs/chunk-failed"))
+        ready_id = self.store.enqueue_job(self.job("https://example.test/jobs/chunk-ready"))
+        self.store.claim_batch(2, owner="nightly")
+
+        result = self.store.commit_batch_results([
+            {"job_id": failed_id, "status": "ready", "language": "en", "full_text": "Too short"},
+            {"job_id": ready_id, "status": "ready", "language": "en", "full_text": valid_english_letter()},
+        ])
+
+        self.assertEqual(result["committed"], 1)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["changed_job_ids"], [ready_id])
+        self.assertEqual(result["failed_job_ids"], [failed_id])
+        self.assertEqual(self.store.get_admin_job(failed_id)["status"], "generating")
+        self.assertEqual(self.store.get_admin_job(ready_id)["status"], "ready")
+
+        repaired = self.store.commit_batch_results([
+            {"job_id": failed_id, "status": "ready", "language": "en", "full_text": valid_english_letter()},
+        ])
+        self.assertEqual(repaired["committed"], 1)
+        self.assertEqual(self.store.get_admin_job(failed_id)["status"], "ready")
+        self.assertEqual(self.store.get_admin_job(failed_id)["attempts"], 1)
 
     def test_english_letter_is_validated_and_redacted(self):
         job_id = self.store.enqueue_job(self.job())
@@ -147,6 +317,35 @@ class CoverLetterStoreTests(unittest.TestCase):
         self.assertTrue(self.store.renew_run_lease("first-run", now=now + timedelta(minutes=1)))
         self.assertTrue(self.store.release_run_lease("first-run"))
         self.assertTrue(self.store.acquire_run_lease("second-run", now=now + timedelta(minutes=1)))
+
+    def test_owner_scoped_claims_renew_and_release_together(self):
+        now = utc_now()
+        first = self.store.enqueue_job(self.job("https://example.test/jobs/owner-1"))
+        second = self.store.enqueue_job(self.job("https://example.test/jobs/owner-2"))
+        self.assertTrue(self.store.acquire_run_lease("batch-run", lease_minutes=15, now=now))
+        claimed = self.store.claim_batch(30, lease_minutes=15, owner="batch-run")
+        self.assertEqual({row["job_id"] for row in claimed}, {first, second})
+        with self.store.connection() as conn:
+            before = conn.execute(
+                "SELECT lease_until,claim_owner FROM cover_letters WHERE job_id=?", (second,)
+            ).fetchone()
+        self.store.commit_result(first, valid_letter(), "de")
+        self.assertTrue(self.store.renew_run_lease("batch-run", lease_minutes=30, now=now + timedelta(minutes=1)))
+        with self.store.connection() as conn:
+            after = conn.execute(
+                "SELECT status,lease_until,claim_owner FROM cover_letters WHERE job_id=?", (second,)
+            ).fetchone()
+        self.assertEqual(after["status"], "generating")
+        self.assertEqual(after["claim_owner"], "batch-run")
+        self.assertGreater(after["lease_until"], before["lease_until"])
+        self.assertTrue(self.store.release_run_lease("batch-run"))
+        self.assertEqual(self.store.get_admin_job(first)["status"], "ready")
+        self.assertEqual(self.store.get_admin_job(second)["status"], "queued")
+
+    def test_large_kk_claim_is_not_subject_to_sandra_daily_cap(self):
+        job_ids = [self.store.enqueue_job(self.job(f"https://example.test/jobs/large-{index}")) for index in range(30)]
+        claimed = self.store.claim_batch(30, owner="batch-run")
+        self.assertEqual({row["job_id"] for row in claimed}, set(job_ids))
 
     def test_evidence_version_change_clears_stale_letter(self):
         job = self.job()
@@ -252,15 +451,59 @@ class CoverLetterStoreTests(unittest.TestCase):
         pushed = Mock(status_code=200)
         pushed.json.return_value = {"ok": True}
 
-        with patch("requests.get", side_effect=[missing, legacy_state]) as get, patch(
-            "requests.post", return_value=pushed
-        ) as post:
+        fake_requests = SimpleNamespace(
+            get=Mock(side_effect=[missing, legacy_state]),
+            post=Mock(return_value=pushed),
+        )
+        with patch.dict("sys.modules", {"requests": fake_requests}):
             result = self.store.sync_cloud("https://example.test", "secret")
 
-        self.assertEqual(get.call_args_list[0].args[0], "https://example.test/api/v1/profiles/kk/state")
-        self.assertEqual(get.call_args_list[1].args[0], "https://example.test/api/v1/state")
-        self.assertEqual(post.call_args.args[0], "https://example.test/api/v1/sync")
+        self.assertEqual(fake_requests.get.call_args_list[0].args[0], "https://example.test/api/v1/profiles/kk/state")
+        self.assertEqual(fake_requests.get.call_args_list[1].args[0], "https://example.test/api/v1/state")
+        self.assertEqual(fake_requests.post.call_args.args[0], "https://example.test/api/v1/sync")
         self.assertEqual(result["pushed"], {"ok": True})
+
+    def test_pull_and_delta_push_are_separate_and_delta_contains_only_changed_jobs(self):
+        first = self.store.enqueue_job(self.job("https://example.test/jobs/delta-1"))
+        self.store.enqueue_job(self.job("https://example.test/jobs/delta-2"))
+        state = Mock(status_code=200)
+        state.json.return_value = {
+            "applications": [], "regeneration_requests": [], "trend_snapshots": [],
+        }
+        pushed = Mock(status_code=200)
+        pushed.json.return_value = {"synced": 1, "mode": "delta"}
+
+        fake_requests = SimpleNamespace(
+            get=Mock(return_value=state),
+            post=Mock(return_value=pushed),
+        )
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            pulled = self.store.pull_cloud("https://example.test", "secret")
+            result = self.store.push_cloud(
+                "https://example.test", "secret", mode="delta", job_ids=[first]
+            )
+
+        self.assertEqual(fake_requests.get.call_count, 1)
+        self.assertEqual(pulled["applications"], 0)
+        payload = fake_requests.post.call_args.kwargs["json"]
+        self.assertEqual(payload["mode"], "delta")
+        self.assertEqual([job["job_id"] for job in payload["jobs"]], [first])
+        self.assertNotIn("trend_snapshots", payload)
+        self.assertEqual(result["mode"], "delta")
+
+    def test_standalone_kk_push_keeps_legacy_route_compatibility(self):
+        missing = Mock(status_code=404)
+        accepted = Mock(status_code=200)
+        accepted.json.return_value = {"synced": 0}
+        fake_requests = SimpleNamespace(
+            post=Mock(side_effect=[missing, accepted]),
+        )
+
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            self.store.push_cloud("https://example.test", "secret", mode="delta", job_ids=[])
+
+        self.assertEqual(fake_requests.post.call_args_list[0].args[0], "https://example.test/api/v1/profiles/kk/sync")
+        self.assertEqual(fake_requests.post.call_args_list[1].args[0], "https://example.test/api/v1/sync")
 
     def test_public_jobs_support_independent_and_combined_sorting(self):
         now = utc_now()
@@ -472,6 +715,31 @@ class WebPrivacyTests(unittest.TestCase):
         self.store.sync_jobs = lambda jobs: len(jobs)
         self.assertIn('"synced": 0', call("Bearer sync-secret"))
         self.assertTrue(captured["status"].startswith("200"))
+
+    def test_delta_sync_updates_only_jobs_without_trend_or_retention_work(self):
+        payload = json.dumps({
+            "mode": "delta",
+            "jobs": self.store.sync_records([self.job_id]),
+        }).encode()
+        captured = {}
+        environ = {
+            "PATH_INFO": "/api/v1/profiles/kk/sync",
+            "QUERY_STRING": "",
+            "REQUEST_METHOD": "POST",
+            "CONTENT_TYPE": "application/json",
+            "CONTENT_LENGTH": str(len(payload)),
+            "wsgi.input": io.BytesIO(payload),
+            "HTTP_AUTHORIZATION": "Bearer sync-secret",
+        }
+
+        def start(status, headers):
+            captured["status"] = status
+
+        response = json.loads(b"".join(self.app(environ, start)).decode())
+
+        self.assertTrue(captured["status"].startswith("200"))
+        self.assertEqual(response, {"mode": "delta", "synced": 1})
+        self.assertEqual(self.store.trend_snapshots(), [])
 
     def test_private_state_api_requires_bearer_token(self):
         captured = {}

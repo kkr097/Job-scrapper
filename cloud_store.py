@@ -228,7 +228,7 @@ class PostgresCoverLetterStore:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trend_profile_date ON trend_snapshots(profile_id,snapshot_date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cloud_jobs_first_seen ON jobs(first_seen)")
 
-    def sync_jobs(self, records: Iterable[dict[str, Any]]) -> int:
+    def sync_jobs(self, records: Iterable[dict[str, Any]], *, prune: bool = True) -> int:
         prepared = [prepare_sync_record(record, self.profile_id) for record in records]
         with self.connection() as conn:
             for item in prepared:
@@ -271,7 +271,8 @@ class PostgresCoverLetterStore:
                     """,
                     item,
                 )
-        self.prune()
+        if prune:
+            self.prune()
         return len(prepared)
 
     def public_jobs(

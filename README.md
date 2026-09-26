@@ -100,29 +100,35 @@ python main.py --profile kk -o custom.csv    # Custom output file
 
 ## Cover Letters and Website
 
-Matched jobs are automatically added to `cover_letters.db`. Cover-letter generation is performed by the personal Codex skill `kk-cover-letter`; the job scraper itself never invents a letter or calls a second LLM.
+Matched jobs are automatically added to each profile's `cover_letters.db`. Every newly scored job meeting that profile's current match threshold is placed in a durable publication outbox and goes live on MatchAtlas immediately after that profile's scoring phase. Cover-letter generation is later enrichment; it never delays the public job link.
 
 Run these commands from a valid WSL Python environment:
 
 ```bash
 python3 cover_letters.py --profile kk sync-csv
-python3 cover_letters.py --profile kk prepare-batch --limit 10
-# Codex writes cover_letter_results.json using the kk-cover-letter skill
-python3 cover_letters.py --profile kk commit-batch --input cover_letter_results.json
-python3 cover_letters.py --profile kk prune
+python3 cover_letters.py --profile kk pull-cloud
+python3 cover_letters.py --profile kk publish-pending
+python3 cover_letters.py --profile kk prepare-batch --limit 40 --owner "$RUN_ID"
+# Codex processes four chunks of at most ten and writes one result array per chunk
+python3 cover_letters.py --profile kk commit-batch --input cover_letter_results.json --summary-output cover_letter_commit.json
+python3 cover_letters.py --profile kk push-cloud --mode delta --job-ids-file cover_letter_commit.json
+python3 cover_letters.py --profile kk push-cloud --mode full
 ```
 
-Every batch item is isolated. Successful letters are saved immediately; failed items remain queued. A changed job description or evidence-profile version invalidates and requeues the old letter. Missing descriptions are shown as `Cover letter unavailable`.
+Each profile claims at most 40 distinct post-cutover score-8-to-10 jobs once, ordered by newest discovery, score, and stable ID. One chunk commit uses one database session while isolating all ten items, so one invalid result cannot roll back the other nine. Generation targets 300–350 words and accepts 285–375 without repair. A real validation failure receives one repair attempt and does not consume another job slot.
 
-The scheduled generator uses a SQLite lease so overlapping watcher runs cannot claim separate batches concurrently. Acquire the lease before cloud synchronization, renew it after each persisted letter, and release it after the final synchronization:
+The nightly coordinator owns one shared lease across KK and Sandra. It gates the start on the current five-hour allowance and prevents scheduled recovery checks or manual runs from duplicating claims:
 
 ```bash
 RUN_ID="cover-letter-$(date +%s)"
-python3 cover_letters.py --profile kk acquire-run --owner "$RUN_ID"
+python3 nightly_cover_letters.py start --owner "$RUN_ID" --remaining-percent 95
 # exit code 75 means another generator is active; exit without changing the queue
-python3 cover_letters.py --profile kk renew-run --owner "$RUN_ID"
-python3 cover_letters.py --profile kk release-run --owner "$RUN_ID"
+python3 nightly_cover_letters.py continue --owner "$RUN_ID" --remaining-percent 80
+python3 cover_letters.py --profile kk renew-claims --owner "$RUN_ID"
+python3 nightly_cover_letters.py finish --owner "$RUN_ID" --status completed
 ```
+
+Pass the same `RUN_ID` to both profiles' `prepare-batch --owner`. KK is always completed first. If the continuation gate closes, `release-claims` returns only that owner's unstarted items safely to the queue. A forced manual coordinator start bypasses usage thresholds only; it does not bypass profile isolation, eligibility, locking, or the 40-job cap.
 
 To create an admin password hash, run `python3 cover_letter_web.py --hash-password`. Store the resulting hash and a long random session secret outside the repository, then start the local server:
 
@@ -143,10 +149,12 @@ The deployed website uses PostgreSQL while scraping, scoring, and letter generat
 ```bash
 export COVER_LETTER_SYNC_URL='https://your-service.onrender.com'
 export COVER_LETTER_SYNC_TOKEN='same-secret-configured-on-render'
-python3 cover_letters.py --profile kk sync-cloud
+python3 cover_letters.py --profile kk pull-cloud
+python3 cover_letters.py --profile kk push-cloud --mode delta --job-id JOB_ID
+python3 cover_letters.py --profile kk push-cloud --mode full
 ```
 
-The server ignores any uploaded public sample and derives redacted body text from the validated full letter. Synchronization requires HTTPS except for local testing.
+`publish-pending` drains only newly scored jobs from the local profile outbox in bounded delta batches. A failed upload remains queued locally and is retried by the next weekday or cover-letter run; after three unsuccessful publication runs it becomes an actionable failure. Delta synchronization upserts only supplied jobs and does not run trend or retention work. One final full synchronization reconciles all retained jobs, updates the trend, applies retention, and acknowledges any outbox records it included. The `sync-cloud` command remains a backward-compatible alias for pull followed by full push. The server ignores uploaded public samples and derives redacted body text from validated full letters.
 
 ### Render and Supabase deployment
 
@@ -154,7 +162,7 @@ The server ignores any uploaded public sample and derives redacted body text fro
 2. Deploy this repository on Render using `render.yaml`.
 3. Configure `DATABASE_URL`, `COVER_LETTER_ADMIN_PASSWORD_HASH`, and `COVER_LETTER_SYNC_TOKEN` as Render secrets. Render generates the session secret.
 4. Configure the Render URL and the same synchronization token in the local WSL environment.
-5. Run `python3 cover_letters.py --profile kk sync-cloud` after generation.
+5. Run one final `push-cloud --mode full` per profile after generation.
 
 Render Free may sleep after inactivity, and Supabase Free may pause inactive projects. The weekday sync supplies regular database activity; the local SQLite database remains the recovery copy.
 
@@ -198,7 +206,7 @@ Codex runs `scripts/run_weekday_pipeline.sh` at 18:05 Europe/Berlin on weekdays.
 .venv/bin/python pipeline_orchestrator.py --profile all
 ```
 
-Scraping and scoring each have a 2 hour 20 minute timeout. A failed scrape prevents scoring; interrupted scoring leaves unprocessed rows in `score_pending_jobs.csv`. The launcher preserves any LM Studio server or model that was already running and reverses only state it created. Logs are written under `logs/`.
+Scraping and scoring each have a 2 hour 20 minute timeout. A failed scrape prevents scoring; interrupted scoring leaves unprocessed rows in `score_pending_jobs.csv`. After each profile scores, its matching jobs publish immediately before the next profile begins scoring. A temporary publication failure preserves the local queue and does not reclassify successful scoring. The launcher preserves any LM Studio server or model that was already running and reverses only state it created. Logs are written under `logs/`.
 
 Validate paths and dependencies without starting LM Studio or changing queues:
 
@@ -206,7 +214,7 @@ Validate paths and dependencies without starting LM Studio or changing queues:
 bash scripts/run_weekday_pipeline.sh --validate-only
 ```
 
-The cover-letter watcher runs every 15 minutes from 18:15 through 23:45 on weekdays. It generates and synchronizes samples only after the local pipeline has released its lock, and exits quietly when no jobs are queued or another generator owns the lease. The older Windows Task Scheduler files remain for compatibility but are not used by the Codex workflow.
+The primary cover-letter gate runs at 23:00 Monday through Friday. Recovery gates run hourly from 00:00 through 03:00 Tuesday through Saturday. A gate starts the shared KK-then-Sandra run only when at least 90% of the five-hour allowance remains. Usage is checked after every chunk; unstarted claims return to the queue below 20%, and scheduled runs start no new chunk after 06:30 Europe/Berlin. Missing or insufficient usage is normally a quiet no-op.
 
 ## Files
 
@@ -216,9 +224,11 @@ The cover-letter watcher runs every 15 minutes from 18:15 through 23:45 on weekd
 | `scraper.py` | Scraping logic |
 | `rater.py` | AI rating |
 | `exporter.py` | CSV/Excel export |
-| `candidate_profile.json` | Candidate profile + rules |
+| `cover_letters.py` | Profile queue, chunk persistence, and cloud synchronization |
+| `nightly_cover_letters.py` | Shared quota gate, nightly marker, and run lease |
+| `profiles/<profile>/private/candidate_profile.json` | Ignored candidate profile and scoring rules |
 | `resume_parser.py` | Resume parsing (fallback) |
-| `config.json` | Configuration |
+| `profiles/<profile>/private/config.json` | Ignored profile configuration |
 
 ## License
 

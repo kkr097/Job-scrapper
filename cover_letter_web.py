@@ -358,6 +358,9 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
             return self._json_response(start_response, {"error": "unauthorized"}, "401 Unauthorized")
         try:
             payload = self._read_json(environ)
+            mode = str(payload.get("mode") or "full").lower()
+            if mode not in {"delta", "full"}:
+                raise ValueError("mode must be 'delta' or 'full'")
             jobs = payload.get("jobs")
             snapshots = payload.get("trend_snapshots") or []
             if not isinstance(jobs, list):
@@ -366,12 +369,21 @@ header strong{{font-size:1.4rem;letter-spacing:.08em}}nav{{display:flex;gap:22px
                 raise ValueError("too many jobs in one request")
             if not isinstance(snapshots, list) or len(snapshots) > 120:
                 raise ValueError("trend_snapshots must be a list of at most 120 items")
+            if mode == "delta" and snapshots:
+                raise ValueError("delta sync cannot update trend snapshots")
             prepared_snapshots = [prepare_trend_snapshot(item) for item in snapshots]
             store = self._profile_store(profile_id)
+            if mode == "delta":
+                synced_jobs = store.sync_jobs(jobs, prune=False)
+                return self._json_response(start_response, {
+                    "mode": "delta",
+                    "synced": synced_jobs,
+                })
             synced_jobs = store.sync_jobs(jobs)
             synced_snapshots = store.sync_trend_snapshots(prepared_snapshots)
             current = store.record_trend_snapshot()
             return self._json_response(start_response, {
+                "mode": "full",
                 "synced": synced_jobs,
                 "trend_snapshots": synced_snapshots,
                 "current_snapshot": current,

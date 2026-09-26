@@ -37,15 +37,16 @@ def _state_path(name: str) -> str:
     return str(ACTIVE_WORKSPACE.output_path(name))
 
 
-def _enqueue_cover_letter(job: dict, config: dict) -> None:
-    """Queue a matched job without allowing this optional feature to stop scoring."""
+def _enqueue_cover_letter(job: dict, config: dict, *, publish: bool = False) -> str | None:
+    """Queue a matched job and, when requested, make it eligible for website publication."""
     try:
         from cover_letters import CoverLetterStore
 
         db_path = _state_path(config.get("cover_letter_db", "cover_letters.db"))
-        CoverLetterStore(db_path, ACTIVE_WORKSPACE.profile_id).enqueue_job(job)
+        return CoverLetterStore(db_path, ACTIVE_WORKSPACE.profile_id).enqueue_job(job, publish=publish)
     except Exception as error:
         print(f"   ⚠ Cover-letter queue unavailable: {error}")
+        return None
 
 
 def _deep_update(base: dict, override: dict) -> dict:
@@ -476,7 +477,7 @@ def main():
                     if _score_success(job):
                         if job.get("score", 0) >= config.get("min_score", 5):
                             append_new_to_csv([job], daily_path)
-                            _enqueue_cover_letter(job, config)
+                            _enqueue_cover_letter(job, config, publish=True)
                         else:
                             append_new_to_csv([job], nonmatch_path)
                         scored_urls.add(url_l)
@@ -661,7 +662,7 @@ def main():
     else:
         append_new_to_excel(matches, output_path)
     for job in matches:
-        _enqueue_cover_letter(job, config)
+        _enqueue_cover_letter(job, config, publish=True)
     
     # Summary
     great_matches = len([j for j in jobs if j.get('score', 0) >= 8])

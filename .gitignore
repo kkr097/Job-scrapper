@@ -30,6 +30,7 @@ cover_letters.db-shm
 cover_letters.db-wal
 cover_letter_batch.json
 cover_letter_results.json
+cover_letter_commit.json
 tests/.tmp/
 tests/.deps/
 /**/*.log
@@ -43,3 +44,4 @@ tests/.deps/
 /.git - Copy/
 /* - Copy.*
 /retry_batch.json
+/runtime/
