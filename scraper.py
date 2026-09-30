@@ -214,10 +214,29 @@ class JobScraper:
             if xing_urls:
                 use_playwright = bool(self.config.get("xing_use_playwright", True))
                 for custom_url in xing_urls:
+                    jobs = []
                     if use_playwright and sync_playwright:
-                        jobs = self._scrape_xing_playwright(base_url=custom_url)
+                        max_pages = max(1, int(self.config.get("xing_max_pages", 40)))
+                        seen_page_urls = set()
+                        for page_number in range(1, max_pages + 1):
+                            page_url = self._xing_page_url(custom_url, page_number)
+                            page_jobs = self._scrape_xing_playwright(base_url=page_url)
+                            new_page_jobs = [
+                                job for job in page_jobs
+                                if job.get("url") not in seen_page_urls
+                            ]
+                            seen_page_urls.update(
+                                job.get("url") for job in page_jobs if job.get("url")
+                            )
+                            jobs.extend(page_jobs)
+                            if page_number > 1 and not new_page_jobs:
+                                break
                     else:
                         jobs = self._scrape_xing(base_url=custom_url)
+                    jobs_by_url = {
+                        job.get("url"): job for job in jobs if job.get("url")
+                    }
+                    jobs = list(jobs_by_url.values())
                     all_jobs.extend(jobs)
                     print(f"   XING custom URL: {len(jobs)} jobs")
                     if not jobs:
@@ -298,12 +317,15 @@ class JobScraper:
                 "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
                 f"?keywords={keyword_enc}&location={location_enc}&f_TPR=r172800"
             )
-        max_pages = int(self.config.get("linkedin_max_pages", 20))
-        page_size = int(self.config.get("linkedin_page_size", 25))
+        # LinkedIn's public guest endpoint delivers 25 cards per response.
+        # Requesting larger pages does not increase that limit, and using a
+        # smaller offset makes pages overlap (0, 10, 20, ...), which wastes
+        # requests and tends to trigger LinkedIn's 429 rate limit.
+        max_pages = max(1, int(self.config.get("linkedin_max_pages", 40)))
+        page_size = 25
         fetch_all = bool(self.config.get("linkedin_fetch_all", False))
-        scroll_step = int(self.config.get("linkedin_scroll_step", page_size))
-        if scroll_step <= 0:
-            scroll_step = page_size
+        request_retries = max(0, int(self.config.get("linkedin_request_retries", 3)))
+        retry_seconds = max(1, float(self.config.get("linkedin_retry_seconds", 45)))
 
         def _extract_total_jobs(soup: BeautifulSoup) -> Optional[int]:
             # Try specific counters first
@@ -320,37 +342,66 @@ class JobScraper:
             return None
         
         try:
-            if fetch_all and max_pages < 10:
-                max_pages = 10
             seen_urls = set()
             empty_pages = 0
-            total_items = max_pages * page_size
-            start_values = list(range(0, total_items, scroll_step))
-            for start in start_values:
+            page_index = 0
+            pages_to_fetch = max_pages
+            while page_index < pages_to_fetch:
+                start = page_index * page_size
                 parsed = urlparse(url)
                 qs = parse_qs(parsed.query)
                 qs["start"] = [str(start)]
                 qs["count"] = [str(page_size)]
                 page_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
-                response = requests.get(page_url, headers=self._get_headers("linkedin"), timeout=15, cookies={})
-                if response.status_code != 200:
-                    self._log_failed_request("linkedin", page_url, f"status={response.status_code}")
-                response.raise_for_status()
+                response = None
+                for attempt in range(request_retries + 1):
+                    try:
+                        response = requests.get(
+                            page_url,
+                            headers=self._get_headers("linkedin"),
+                            timeout=20,
+                            cookies={},
+                        )
+                        if response.status_code == 200:
+                            break
+                        if response.status_code not in {429, 500, 502, 503, 504}:
+                            response.raise_for_status()
+                    except requests.RequestException as error:
+                        if attempt == request_retries:
+                            raise error
+                    if attempt == request_retries:
+                        assert response is not None
+                        self._log_failed_request("linkedin", page_url, f"status={response.status_code}")
+                        response.raise_for_status()
+                    retry_after = response.headers.get("Retry-After") if response is not None else None
+                    try:
+                        wait_seconds = max(retry_seconds, float(retry_after)) if retry_after else retry_seconds
+                    except (TypeError, ValueError):
+                        wait_seconds = retry_seconds
+                    print(f"   ⚠ LinkedIn returned a temporary error; retrying in {int(wait_seconds)}s...")
+                    time.sleep(wait_seconds)
+                if response is None or response.status_code != 200:
+                    break
                 soup = BeautifulSoup(response.text, 'lxml')
-                if start == 0 and (fetch_all or max_pages <= 0):
+                if start == 0 and fetch_all:
                     total = _extract_total_jobs(soup)
                     if total:
-                        max_pages = max(1, math.ceil(total / page_size))
-                        total_items = max_pages * page_size
-                        start_values = list(range(0, total_items, scroll_step))
+                        pages_to_fetch = min(max_pages, max(1, math.ceil(total / page_size)))
 
                 cards = soup.find_all(class_=re.compile(r'base-card|job-search-card|result-card|job-result-card'))
                 if not cards:
-                    break
+                    empty_pages += 1
+                    if empty_pages >= 2:
+                        break
+                    page_index += 1
+                    self._linkedin_delay()
+                    continue
 
                 new_found = 0
                 for card in cards:
                     job = self._parse_linkedin_card(card)
+                    if job:
+                        self._enrich_linkedin_description(job)
                     if job and not self._should_exclude(job):
                         url_l = (job.get("url") or "").lower()
                         if url_l and url_l in seen_urls:
@@ -361,14 +412,10 @@ class JobScraper:
                         self._emit_job(job)
                         new_found += 1
                     self._linkedin_card_delay()
-                if new_found == 0:
-                    empty_pages += 1
-                    if empty_pages >= 3:
-                        break
-                else:
-                    empty_pages = 0
+                empty_pages = 0
                 # Slow down between pages to mimic human scrolling pace
                 self._linkedin_delay()
+                page_index += 1
                     
         except Exception as e:
             print(f"   âš  LinkedIn error: {e}")
@@ -448,6 +495,8 @@ class JobScraper:
                     break
                 for card in cards:
                     job = self._parse_linkedin_card(card)
+                    if job:
+                        self._enrich_linkedin_description(job)
                     if job and not self._should_exclude(job):
                         jobs.append(job)
                         self._emit_job(job)
@@ -472,6 +521,18 @@ class JobScraper:
                 r'job-search-card__location|result-card__location'
             ))
             location = loc_elem.get_text(strip=True) if loc_elem else self.locations[0]
+
+            description = ""
+            description_elem = card.find(
+                ['p', 'div', 'span'],
+                class_=re.compile(
+                    r'base-search-card__snippet|job-search-card__snippet|'
+                    r'result-card__snippet|job-search-card__description|'
+                    r'base-search-card__description'
+                )
+            )
+            if description_elem:
+                description = description_elem.get_text(" ", strip=True)
             
             link = card.find('a', class_=re.compile(
                 r'base-card__full-link|result-card__full-card-link|job-result-card__full-card-link|result-card__full-link'
@@ -483,10 +544,70 @@ class JobScraper:
             
             return {
                 'title': title, 'company': company, 'location': location,
-                'url': url, 'source': 'LinkedIn', 'date_found': datetime.now().isoformat()
+                'url': url, 'description': description,
+                'source': 'LinkedIn', 'date_found': datetime.now().isoformat()
             }
         except:
             return None
+
+    def _enrich_linkedin_description(self, job: Dict) -> None:
+        """Replace a search-card snippet with the public job-page description."""
+        if not self.config.get("linkedin_fetch_full_descriptions", True):
+            return
+        url = (job.get("url") or "").strip()
+        if not url or not url.startswith("http"):
+            return
+        try:
+            response = requests.get(
+                url,
+                headers=self._get_headers("linkedin"),
+                timeout=float(self.config.get("linkedin_description_timeout_seconds", 20)),
+                cookies={},
+            )
+            if response.status_code != 200:
+                return
+            soup = BeautifulSoup(response.text, "lxml")
+            selectors = [
+                ".description__text",
+                ".show-more-less-html__markup",
+                ".jobs-description__content",
+                "section.description",
+                "div[data-job-details]",
+            ]
+            description = ""
+            for selector in selectors:
+                element = soup.select_one(selector)
+                if element:
+                    candidate = element.get_text(" ", strip=True)
+                    if len(candidate) > len(description):
+                        description = candidate
+
+            if not description:
+                for script in soup.select('script[type="application/ld+json"]'):
+                    try:
+                        payload = json.loads(script.string or script.get_text())
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    payloads = payload if isinstance(payload, list) else [payload]
+                    for item in payloads:
+                        if isinstance(item, dict):
+                            candidate = BeautifulSoup(
+                                str(item.get("description") or ""), "lxml"
+                            ).get_text(" ", strip=True)
+                            if len(candidate) > len(description):
+                                description = candidate
+
+            if description:
+                job["description"] = description
+        except requests.RequestException:
+            return
+
+    def _xing_page_url(self, base_url: str, page_number: int) -> str:
+        """Build a numbered XING results URL without losing existing filters."""
+        parts = urlparse(base_url)
+        query = parse_qs(parts.query, keep_blank_values=True)
+        query["page"] = [str(page_number)]
+        return urlunparse(parts._replace(query=urlencode(query, doseq=True)))
 
     def _scrape_xing(self, base_url: str) -> List[Dict]:
         """Scrape XING public job search (basic, list-page only)."""
@@ -525,14 +646,24 @@ class JobScraper:
                     loc_elem = card.find(['span', 'div'], class_=re.compile(r'location|city', re.IGNORECASE)) if card else None
                     location = loc_elem.get_text(strip=True) if loc_elem else ""
 
+                    description = ""
+                    description_elem = card.find(
+                        ['p', 'div', 'span'],
+                        class_=re.compile(r'description|snippet|summary|teaser', re.IGNORECASE)
+                    )
+                    if description_elem:
+                        description = description_elem.get_text(" ", strip=True)
+
                     job = {
                         'title': title,
                         'company': company,
                         'location': location,
                         'url': url,
+                        'description': description,
                         'source': 'XING',
                         'date_found': datetime.now().isoformat()
                     }
+                    self._enrich_xing_description(job)
                     if not self._should_exclude(job):
                         jobs.append(job)
                         self._emit_job(job)
@@ -563,9 +694,11 @@ class JobScraper:
                         'company': company,
                         'location': location,
                         'url': url,
+                        'description': "",
                         'source': 'XING',
                         'date_found': datetime.now().isoformat()
                     }
+                    self._enrich_xing_description(job)
                     if not self._should_exclude(job):
                         jobs.append(job)
                         self._emit_job(job)
@@ -575,6 +708,53 @@ class JobScraper:
             self._log_failed_request("xing", base_url, f"error={e}")
         return jobs
 
+    def _enrich_xing_description(self, job: Dict) -> None:
+        """Fetch the public XING job page and extract its full description."""
+        if not self.config.get("xing_fetch_full_descriptions", True):
+            return
+        url = (job.get("url") or "").strip()
+        if not url or not url.startswith("http"):
+            return
+        try:
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                timeout=float(self.config.get("xing_description_timeout_seconds", 20)),
+            )
+            if response.status_code != 200:
+                return
+            soup = BeautifulSoup(response.text, "lxml")
+            description = ""
+            for selector in [
+                '[class*="description"]',
+                '[class*="job-detail"]',
+                '[class*="jobDescription"]',
+                'main article',
+                'main',
+            ]:
+                element = soup.select_one(selector)
+                if element:
+                    candidate = element.get_text(" ", strip=True)
+                    if len(candidate) > len(description):
+                        description = candidate
+            for script in soup.select('script[type="application/ld+json"]'):
+                try:
+                    payload = json.loads(script.string or script.get_text())
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                payloads = payload if isinstance(payload, list) else [payload]
+                for item in payloads:
+                    if isinstance(item, dict):
+                        candidate = BeautifulSoup(
+                            str(item.get("description") or ""), "lxml"
+                        ).get_text(" ", strip=True)
+                        if len(candidate) > len(description):
+                            description = candidate
+            if description:
+                job["description"] = description
+        except requests.RequestException:
+            return
+
     def _scrape_xing_playwright(self, base_url: str) -> List[Dict]:
         """Scrape XING job search using Playwright to click 'Show more'."""
         jobs = []
@@ -583,13 +763,26 @@ class JobScraper:
 
         max_clicks = int(self.config.get("xing_max_clicks", 25))
         headless = bool(self.config.get("xing_headless", True))
-        show_more_selector = "button:has-text('Show more'), span:has-text('Show more')"
+        show_more_selector = "button:has-text('Show more'), [role='button']:has-text('Show more')"
 
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=headless)
                 page = browser.new_page()
-                page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
+                navigation_timeout = int(self.config.get("xing_navigation_timeout_ms", 60000))
+                try:
+                    # XING may abort the original request while redirecting to
+                    # its canonical search URL. A committed page is still usable.
+                    page.goto(base_url, wait_until="commit", timeout=navigation_timeout)
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=navigation_timeout)
+                    except Exception:
+                        pass
+                except Exception as navigation_error:
+                    if "ERR_ABORTED" not in str(navigation_error) or page.url in ("", "about:blank"):
+                        raise
+                    print(f"   ⚠ XING navigation interrupted after commit: {page.url}")
+                self._accept_cookies_playwright(page)
 
                 stagnant = 0
                 for _ in range(max_clicks):
@@ -602,7 +795,12 @@ class JobScraper:
                         before = page.locator("a[href*='/jobs/']").count()
                         if page.locator(show_more_selector).count() == 0:
                             break
-                        page.locator(show_more_selector).first.click(timeout=5000)
+                        try:
+                            page.locator(show_more_selector).first.click(timeout=5000)
+                        except Exception:
+                            # Consent can appear after the initial page load.
+                            self._accept_cookies_playwright(page)
+                            page.locator(show_more_selector).first.click(timeout=5000)
                         page.wait_for_timeout(1500)
                         after = page.locator("a[href*='/jobs/']").count()
                         if after <= before:
@@ -640,14 +838,24 @@ class JobScraper:
                     loc_elem = card.find(['span', 'div'], class_=re.compile(r'location|city', re.IGNORECASE)) if card else None
                     location = loc_elem.get_text(strip=True) if loc_elem else ""
 
+                    description = ""
+                    description_elem = card.find(
+                        ['p', 'div', 'span'],
+                        class_=re.compile(r'description|snippet|summary|teaser', re.IGNORECASE)
+                    )
+                    if description_elem:
+                        description = description_elem.get_text(" ", strip=True)
+
                     job = {
                         'title': title,
                         'company': company,
                         'location': location,
                         'url': url,
+                        'description': description,
                         'source': 'XING',
                         'date_found': datetime.now().isoformat()
                     }
+                    self._enrich_xing_description(job)
                     if not self._should_exclude(job):
                         jobs.append(job)
                         self._emit_job(job)
