@@ -73,7 +73,11 @@
     "cache_days": 45,
     "min_score": 5,
     "groq_wait_seconds": 30,
-    "rating_preferred": "groq"
+    "rating_preferred": "groq",
+    "filter_policy_mode": "legacy",
+    "source_record_store": true,
+    "description_refresh_days": 14,
+    "description_max_retries": 3
     ,
     "scrape_test_mode": false
 }

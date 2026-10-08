@@ -26,3 +26,6 @@ Thumbs.db
 /**/*.log
 /**/*.ps1
 /**/*.csv
+
+# Local description cache (rebuilt automatically)
+runtime/

@@ -9,6 +9,12 @@ from typing import List, Dict
 
 import requests
 
+from filter_policy import Policy
+from title_rules import TITLE_PENALTY_MAX_SCORE
+
+SPARSE_DESCRIPTION_CHARS = 80       # below this the model has no evidence to judge
+SPARSE_DESCRIPTION_MAX_SCORE = 5      # so it can never reach the match threshold (6)
+
 
 class JobRater:
     """Rate jobs against resume using AI (DeepSeek, Gemini, or Groq)."""
@@ -16,6 +22,14 @@ class JobRater:
     def __init__(self, config: dict, candidate_profile: dict):
         self.candidate_profile = candidate_profile
         self.config = config
+        rules = candidate_profile.get("matching_rules", {}) if isinstance(candidate_profile, dict) else {}
+        self.policy = Policy.from_matching_rules(rules)
+        # A job without evidence must stay below the match threshold, whatever min_score is.
+        try:
+            threshold = int(config.get("min_score", 6))
+        except (TypeError, ValueError):
+            threshold = 6
+        self.sparse_cap = max(1, min(SPARSE_DESCRIPTION_MAX_SCORE, threshold - 1))
         
         # Determine which API to use
         self.api_type = None
@@ -85,16 +99,31 @@ class JobRater:
     
     def _rate_batch(self, jobs: List[Dict]) -> List[Dict]:
         """Rate a batch of jobs with AI."""
-        candidate_json = json.dumps(self.candidate_profile, ensure_ascii=False)
+        prompt_profile = json.loads(json.dumps(self.candidate_profile))
+        if isinstance(prompt_profile, dict):
+            # Keyword rules are evaluated in code (filter_policy.py); hide the raw lists and the
+            # title cap rule so the model cannot guess hits, e.g. "IT" in "it is".
+            prompt_profile.get("matching_rules", {}).pop("negative_title_keywords", None)
+            prompt_profile.get("matching_rules", {}).pop("negative_description_keywords", None)
+            prompt_profile.get("scoring_protocol", {}).pop("title_filter_mandatory", None)
+        candidate_json = json.dumps(prompt_profile, ensure_ascii=False)
+        decisions = [self.policy.evaluate(j) for j in jobs]
 
         job_blocks = []
         for idx, job in enumerate(jobs, 1):
+            decision = decisions[idx - 1]
             desc = (job.get("description") or "").strip()
             if len(desc) > 2000:
                 desc = desc[:2000] + "..."
             block = "\n".join([
                 f"JOB {idx}",
                 f"Title: {job.get('title','')}",
+                "Title penalty (checked by code, authoritative): " + (
+                    f"HIT '{decision.rule}' - cap the score at {TITLE_PENALTY_MAX_SCORE}" if decision.cap else "none"
+                ),
+                "Policy signals (from code; weigh in context, not automatic rejection): " + (
+                    "; ".join(decision.signals) or "none"
+                ),
                 f"Company: {job.get('company','')}",
                 f"Location: {job.get('location','')}",
                 f"URL: {job.get('url','')}",
@@ -134,17 +163,54 @@ Perform a "Step-by-Step Gap Analysis" before assigning the final score to ensure
 
 3. **Seniority & Role Fit (Penalty Weight: 20%):**
    - Candidate has ~4 years professional/academic experience (Mid-level).
-   - APPLY HARD PENALTY (Score < 3) if the job is:
-     - Pure Management: (Lead, Manager, Director, Projektleiter, Owner).
+   - APPLY HARD PENALTY (Score < 3) if the job's actual duties are:
+     - Pure Management: people/budget/project management with little hands-on engineering
+       (a title word such as Lead or Manager is only a signal; judge the duties).
      - Wrong Tech Stack: (Cloud, DevOps, Java, Web, Fullstack, SAP, PLC/SPS).
      - Entry Level: (Intern, Praktikant, Masterarbeit, Student).
+
+---
+
+Title penalties are decided by code: use ONLY the "Title penalty (checked by code,
+authoritative)" line of each job. If it says "none", do not apply or mention any title
+penalty; never infer one from words in the description or from the title's meaning.
+The "Policy signals" line lists keyword matches found by code. They are evidence to
+weigh in context (a signal can be wrong, e.g. a company name); they never mean automatic
+rejection. If it says "none", do not claim any keyword penalty.
+
+Score using this explicit calibration:
+- 9-10: Strong match for the required stack and domain, with only minor gaps.
+- 7-8: Good match with the main stack present and manageable missing skills.
+- 5-6: Partial match; some relevant skills but important requirements are missing.
+- 3-4: Weak match with limited technical overlap.
+- 1-2: Hard title penalty or clearly incompatible role/domain.
+Do not award a high score from a generic software title alone. Do not reduce a
+score merely because an optional skill is missing.
+
+Stricter evidence rules (a review against an independent rater found local and fast models
+about 1.4 points too generous, mostly on roles that only share a buzzword with the profile):
+- A score of 6 or more needs the day-to-day work itself, not just a keyword, to sit in the
+  candidate's core tech stack and domain. A matching technology that is only a side topic
+  or a nice-to-have is at most 5.
+- A score of 7 or more needs at least two concrete core-stack items named in the
+  description, and a role the candidate could start in without a career change.
+- Roles whose main work is not hands-on engineering score at most 4: pre-sales, sales
+  engineering, solution/enterprise architecture and consulting, field application
+  engineering, customer-facing forward-deployed roles, recruiting, project or product
+  management, contract code-review or AI-training gigs, and research-scientist roles that
+  centre on training new models or a PhD profile.
+- A different engineering field that merely uses the same buzzword is at most 5.
+- Seniority: Principal, Staff, Head or team-lead scope far above the candidate's
+  experience is at most 5 even when the stack matches.
+- If the description is missing, empty or just a title/company line, judge from the title
+  alone and give at most 5. Never guess requirements that are not written.
 
 ---
 
 ### EVALUATION STEPS
 1. **Extraction:** List the top 5 technical requirements from the Job Description.
 2. **Comparison:** Identify which of these the candidate possesses.
-3. **Red Flag Check:** Scan for negative title keywords and non-embedded tech stacks.
+3. **Red Flag Check:** Scan for non-matching tech stacks and role types (title penalties come from code).
 4. **Scoring:** Calculate the 1-10 score based on weights above.
 
 ---
@@ -207,6 +273,10 @@ JOBS TO EVALUATE:
                     except Exception:
                         score = 5
                     score = max(1, min(10, score))
+                    if decisions[idx].cap:
+                        score = min(score, decisions[idx].cap)
+                    if len((job.get('description') or '').strip()) < SPARSE_DESCRIPTION_CHARS:
+                        score = min(score, self.sparse_cap)  # no evidence, no match
                     job['score'] = score
                     job['match_reasons'] = rating.get("verdict", "")
                     missing = rating.get("analysis", {}).get("missing_skills", [])
