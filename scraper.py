@@ -14,6 +14,9 @@ import time
 import random
 from datetime import datetime
 from typing import List, Dict, Optional
+
+from source_records import OK, canonical_url
+from xing_extract import assess_xing, clean_body, decode_response, header_location, parse_jobposting
 from urllib.parse import urlencode, quote_plus, urljoin, urlparse, parse_qs, urlunparse
 
 import requests
@@ -57,6 +60,89 @@ class JobScraper:
             "gemini_cooldown_until": 0
         }
         self._on_job = None
+        # Per-run enrichment counters (see _instrument_enrich / _log_enrichment_stats).
+        self._stats: Dict[str, float] = {}
+        self._enrich_urls: Dict[str, int] = {}
+        # Shared source-record store (source_records.RecordStore) and a per-run description cache.
+        self.record_store = None
+        self._run_cache: Dict[str, str] = {}
+        self._last_http_status: Optional[int] = None
+
+    def attach_record_store(self, store) -> None:
+        self.record_store = store
+
+    def _enrich_with_cache(self, source: str, job: Dict, impl) -> None:
+        """Fetch a description only when the shared store says it is needed.
+
+        Order: repeat within this run -> stored fresh/backing-off record -> real fetch.
+        Cached text is also served to the other profile, so a job is fetched once.
+        """
+        url = (job.get("url") or "").strip()
+        if not url.startswith("http") or not self.config.get(f"{source}_fetch_full_descriptions", True):
+            impl(job)
+            return
+        key = canonical_url(url)[2]
+        if key in self._run_cache:
+            self._stat(f"{source}_enrich_run_cache_hits")
+            if self._run_cache[key]:
+                job["description"] = self._run_cache[key]
+            return
+        store = self.record_store
+        if store is not None:
+            store.observe(url)
+            fetch, reason = store.decide(url)
+            self._stat(f"{source}_enrich_decision_{reason}")
+            if not fetch:
+                cached = store.description(url)
+                if cached:
+                    job["description"] = cached
+                self._run_cache[key] = cached
+                return
+        self._last_http_status = None
+        self._last_quality_status = None
+        before = job.get("description") or ""
+        self._instrument_enrich(source, job, impl)
+        after = job.get("description") or ""
+        fetched = after if after != before else ""
+        self._run_cache[key] = fetched
+        if store is not None:
+            status = store.record_result(url, fetched, self._last_http_status,
+                                         status_override=getattr(self, "_last_quality_status", None))
+            self._stat(f"{source}_enrich_status_{status}")
+
+    def _stat(self, key: str, amount: float = 1) -> None:
+        self._stats[key] = self._stats.get(key, 0) + amount
+
+    def _instrument_enrich(self, source: str, job: Dict, impl) -> None:
+        """Run one description fetch and record attempts, repeats, outcome and seconds."""
+        url = (job.get("url") or "").strip()
+        if not url.startswith("http"):
+            impl(job)
+            return
+        key = url.lower()
+        self._stat(f"{source}_enrich_attempts")
+        if key in self._enrich_urls:
+            self._stat(f"{source}_enrich_repeat_fetches")
+        self._enrich_urls[key] = self._enrich_urls.get(key, 0) + 1
+        original = job.get("description") or ""
+        started = time.time()
+        try:
+            impl(job)
+        finally:
+            self._stat(f"{source}_enrich_seconds", time.time() - started)
+        updated = job.get("description") or ""
+        self._stat(f"{source}_enrich_ok" if updated and updated != original else f"{source}_enrich_no_text")
+
+    def _log_enrichment_stats(self) -> None:
+        if not self._stats:
+            return
+        parts = [f"unique_urls={len(self._enrich_urls)}"]
+        for key in sorted(self._stats):
+            value = self._stats[key]
+            parts.append(f"{key}={round(value) if key.endswith('_seconds') else int(value)}")
+        details = "enrichment " + " ".join(parts)
+        print(f"   • {details}")
+        self._log_event("daily_summary", {"source": "enrichment", "company": "", "url": "", "details": details})
     
     def _get_headers(self, source: Optional[str] = None) -> dict:
         if source == "linkedin":
@@ -295,6 +381,7 @@ class JobScraper:
         print(f"\nâœ“ Total unique jobs: {len(unique_jobs)}")
         
         self._log_daily_summary(unique_jobs, time.time() - started)
+        self._log_enrichment_stats()
         return unique_jobs
 
     def _emit_job(self, job: Dict) -> None:
@@ -400,14 +487,13 @@ class JobScraper:
                 new_found = 0
                 for card in cards:
                     job = self._parse_linkedin_card(card)
-                    if job:
-                        self._enrich_linkedin_description(job)
                     if job and not self._should_exclude(job):
                         url_l = (job.get("url") or "").lower()
                         if url_l and url_l in seen_urls:
-                            continue
+                            continue  # repeat card: skip before spending a page fetch on it
                         if url_l:
                             seen_urls.add(url_l)
+                        self._enrich_linkedin_description(job)
                         jobs.append(job)
                         self._emit_job(job)
                         new_found += 1
@@ -551,6 +637,9 @@ class JobScraper:
             return None
 
     def _enrich_linkedin_description(self, job: Dict) -> None:
+        self._enrich_with_cache("linkedin", job, self._enrich_linkedin_description_impl)
+
+    def _enrich_linkedin_description_impl(self, job: Dict) -> None:
         """Replace a search-card snippet with the public job-page description."""
         if not self.config.get("linkedin_fetch_full_descriptions", True):
             return
@@ -564,6 +653,8 @@ class JobScraper:
                 timeout=float(self.config.get("linkedin_description_timeout_seconds", 20)),
                 cookies={},
             )
+            self._stat(f"linkedin_http_{response.status_code}")
+            self._last_http_status = response.status_code
             if response.status_code != 200:
                 return
             soup = BeautifulSoup(response.text, "lxml")
@@ -600,6 +691,7 @@ class JobScraper:
             if description:
                 job["description"] = description
         except requests.RequestException:
+            self._last_http_status = -1
             return
 
     def _xing_page_url(self, base_url: str, page_number: int) -> str:
@@ -709,6 +801,9 @@ class JobScraper:
         return jobs
 
     def _enrich_xing_description(self, job: Dict) -> None:
+        self._enrich_with_cache("xing", job, self._enrich_xing_description_impl)
+
+    def _enrich_xing_description_impl(self, job: Dict) -> None:
         """Fetch the public XING job page and extract its full description."""
         if not self.config.get("xing_fetch_full_descriptions", True):
             return
@@ -721,38 +816,52 @@ class JobScraper:
                 headers=self._get_headers(),
                 timeout=float(self.config.get("xing_description_timeout_seconds", 20)),
             )
+            self._stat(f"xing_http_{response.status_code}")
+            self._last_http_status = response.status_code
             if response.status_code != 200:
                 return
-            soup = BeautifulSoup(response.text, "lxml")
+            html = decode_response(response.content, response.headers.get("Content-Type"))
+            soup = BeautifulSoup(html, "lxml")
+            posting = parse_jobposting(soup)
             description = ""
-            for selector in [
-                '[class*="description"]',
-                '[class*="job-detail"]',
-                '[class*="jobDescription"]',
-                'main article',
-                'main',
-            ]:
-                element = soup.select_one(selector)
-                if element:
-                    candidate = element.get_text(" ", strip=True)
-                    if len(candidate) > len(description):
-                        description = candidate
-            for script in soup.select('script[type="application/ld+json"]'):
-                try:
-                    payload = json.loads(script.string or script.get_text())
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                payloads = payload if isinstance(payload, list) else [payload]
-                for item in payloads:
-                    if isinstance(item, dict):
-                        candidate = BeautifulSoup(
-                            str(item.get("description") or ""), "lxml"
-                        ).get_text(" ", strip=True)
-                        if len(candidate) > len(description):
-                            description = candidate
-            if description:
+            if posting and len(posting["description"]) >= 150:
+                description = posting["description"]
+                self._stat("xing_extract_jsonld")
+            else:
+                page_text = ""
+                for selector in [
+                    '[class*="description"]',
+                    '[class*="job-detail"]',
+                    '[class*="jobDescription"]',
+                    'main article',
+                    'main',
+                ]:
+                    element = soup.select_one(selector)
+                    if element:
+                        candidate = element.get_text(" ", strip=True)
+                        if len(candidate) > len(page_text):
+                            page_text = candidate
+                description = clean_body(page_text)
+                self._stat("xing_extract_selector")
+                if not job.get("location") or job.get("location") == "Unknown":
+                    found = header_location(page_text)
+                    if found:
+                        job["location"] = found
+            if posting:
+                if posting["company"] and (job.get("company") or "Unknown") in ("", "Unknown"):
+                    job["company"] = posting["company"]
+                if posting["location"] and not job.get("location"):
+                    job["location"] = posting["location"]
+            quality, flags = assess_xing(description, job.get("title") or "")
+            self._stat(f"xing_quality_{quality}")
+            if quality == OK:
                 job["description"] = description
+            else:
+                self._last_quality_status = quality
+                if flags:
+                    self._stat(f"xing_flag_{flags.split(',')[0]}")
         except requests.RequestException:
+            self._last_http_status = -1
             return
 
     def _scrape_xing_playwright(self, base_url: str) -> List[Dict]:

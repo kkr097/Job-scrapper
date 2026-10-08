@@ -154,3 +154,11 @@ python main.py --score-only
 ## License
 
 MIT
+
+## Scoring and scraping improvements
+
+- **Title rules decided in code** (`title_rules.py`, `filter_policy.py`): whole-word matching, and short tokens such as `IT`, `AI`, `KI` only count when written in capitals (the pronoun "it" no longer matches). The scorer receives a "Title penalty" line and "Policy signals" from code instead of guessing keyword hits. Set `"filter_policy_mode": "enforce"` in `config.json` to hard-reject only non-jobs (Ausbildung, Praktikum, Werkstudent, Masterarbeit, student, intern) and clearly off-field titles (SAP, Java, .NET, Fullstack, Backend, Android, Data Scientist); ambiguous words (lead, expert, manager, IT, AI) then reach the scorer as signals. Default `legacy` keeps the existing keyword pre-filter.
+- **Stricter scoring prompt** (`rater.py`): a 6+ needs the day-to-day work in the core stack, a 7+ needs two concrete stack items, non-engineering roles (pre-sales, solution architect, consulting, ...) score at most 4, and a job with no real description can never reach the match threshold.
+- **Description cache** (`source_records.py`, local `runtime/source_records.db`): descriptions are fetched once, reused for 14 days, failed fetches are retried at most 3 times with 6/24/72 h backoff, repeat LinkedIn cards are skipped before any fetch, and an `enrichment` line with fetch statistics is written to the daily summary log. Disable with `"source_record_store": false`.
+- **XING extraction** (`xing_extract.py`): decodes the page from raw bytes (no more mojibake), prefers schema.org JobPosting JSON-LD, keeps only the job body, fills company/location, and quarantines low-quality text instead of scoring it.
+- Tests: `python -m unittest tests.test_rater_scoring tests.test_filter_policy tests.test_source_records tests.test_xing_extract tests.test_scraper_instrumentation`

@@ -24,6 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scraper import JobScraper
 from exporter import append_new_to_excel, append_new_to_csv, load_existing_urls, load_cache, save_cache, prune_cache
 from resume_parser import get_resume_summary, generate_config_from_resume, parse_resume
+from filter_policy import CASE_SENSITIVE_TOKENS, HARD, Policy
+from title_rules import contains_keyword
 
 
 def _deep_update(base: dict, override: dict) -> dict:
@@ -237,16 +239,24 @@ def main():
     matching_rules = candidate_profile.get("matching_rules", {}) if isinstance(candidate_profile, dict) else {}
     negative_title_kw = matching_rules.get("negative_title_keywords", [])
     negative_description_kw = matching_rules.get("negative_description_keywords", [])
-    negative_title_kw = [k.strip().lower() for k in negative_title_kw if isinstance(k, str) and k.strip()]
-    negative_description_kw = [k.strip().lower() for k in negative_description_kw if isinstance(k, str) and k.strip()]
+    negative_title_kw = [k.strip() for k in negative_title_kw if isinstance(k, str) and k.strip()]
+    negative_description_kw = [k.strip() for k in negative_description_kw if isinstance(k, str) and k.strip()]
+    # filter_policy_mode: "legacy" (default) keeps the keyword pre-filter; "enforce" rejects only
+    # non-jobs and clearly off-field titles (filter_policy.py) and lets ambiguous words reach the scorer.
+    filter_mode = str(config.get("filter_policy_mode", "legacy")).strip().lower()
+    policy = Policy.from_matching_rules(matching_rules)
 
     def _contains_keyword(text: str, keyword: str) -> bool:
-        """Match terms without treating short words as arbitrary substrings."""
-        return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text, re.IGNORECASE) is not None
+        """Whole-word match; short tokens such as IT/AI/KI only count when written in capitals,
+        so the pronoun "it" in a description never triggers the IT keyword."""
+        return contains_keyword(text, keyword.upper() if keyword.lower() in CASE_SENSITIVE_TOKENS else keyword,
+                                keyword.lower() in CASE_SENSITIVE_TOKENS)
 
     def _has_skip_keyword(job: dict) -> bool:
-        title = (job.get("title") or "").lower()
-        desc = (job.get("description") or "").lower()
+        if filter_mode == "enforce":
+            return policy.evaluate(job).effect == HARD
+        title = job.get("title") or ""
+        desc = job.get("description") or ""
         return any(_contains_keyword(title, k) for k in negative_title_kw) or any(
             _contains_keyword(desc, k) for k in negative_description_kw
         )
@@ -290,6 +300,18 @@ def main():
     except Exception as e:
         print(f"   ⚠ Debug log write failed: {e}", flush=True)
     scraper = JobScraper(config)
+    if config.get("source_record_store", True):
+        try:
+            from source_records import RecordStore
+            runtime_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime")
+            os.makedirs(runtime_dir, exist_ok=True)
+            scraper.attach_record_store(RecordStore(
+                os.path.join(runtime_dir, "source_records.db"),
+                refresh_days=int(config.get("description_refresh_days", 14)),
+                max_retries=int(config.get("description_max_retries", 3)),
+            ))
+        except Exception as e:  # never block a run on the cache
+            print(f"   Source-record store unavailable, fetching normally: {e}", flush=True)
 
     pending_file = config.get("score_pending_file", "score_pending_jobs.csv")
     pending_path = os.path.join(os.path.dirname(__file__), pending_file)
